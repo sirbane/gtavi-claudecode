@@ -403,9 +403,42 @@ def youtube_probe() -> bool:
     say("YouTube reachability probe: BLOCKED/FAILED -> " + ((result.stderr or result.stdout or "no output").strip()[-700:]))
     return False
 
+TWITCH_GQL = "https://gql.twitch.tv/gql"
+TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"  # public web Client-Id, same one the repo's twitch.py uses
+TWITCH_CLIPS_QUERY = """query($login:String!,$n:Int!){ user(login:$login){ displayName clips(first:$n, criteria:{period:LAST_DAY, sort:VIEWS_DESC}){ edges{ node{ slug title viewCount durationSeconds game{ name } broadcaster{ displayName login } } } } } }"""
+
+def twitch_clip_sources(streams: list[dict[str, str]], max_channels: int = 5, per_channel: int = 8) -> list[dict[str, str]]:
+    """Top GTA 6 clips of the last 24h from the streamers we already found. Twitch works from GitHub runners; YouTube does not."""
+    rows: list[dict[str, Any]] = []
+    for stream in streams[:max_channels]:
+        login = (stream.get("url") or "").rstrip("/").split("/")[-1].lower()
+        if not login:
+            continue
+        try:
+            response = SESSION.post(TWITCH_GQL, json={"query": TWITCH_CLIPS_QUERY, "variables": {"login": login, "n": per_channel}},
+                                    headers={"Client-Id": TWITCH_CLIENT_ID}, timeout=20)
+            response.raise_for_status()
+            user = ((response.json().get("data") or {}).get("user")) or {}
+        except Exception as exc:
+            say(f"Twitch clips lookup failed for {login}: {exc}")
+            continue
+        for edge in ((user.get("clips") or {}).get("edges") or []):
+            node = edge.get("node") or {}
+            game = ((node.get("game") or {}).get("name") or "").lower()
+            if not node.get("slug") or float(node.get("durationSeconds") or 0) < 18:
+                continue
+            if game and not ("grand theft" in game or "gta" in game):
+                continue
+            rows.append({"title": node.get("title") or "GTA 6 clip", "url": "https://clips.twitch.tv/" + node["slug"],
+                         "channel": (node.get("broadcaster") or {}).get("displayName") or login,
+                         "views": int(node.get("viewCount") or 0)})
+    rows.sort(key=lambda item: item["views"], reverse=True)
+    say(f"Twitch top clips of the last 24h: {len(rows)} usable clips from {min(len(streams), max_channels)} channels.")
+    return [{k: v for k, v in item.items() if k != "views"} for item in rows]
+
 def ytsearch_fallback() -> list[dict[str, str]]:
     """Fallback to yt-dlp's built-in YouTube search if the original trend URL returns no entries."""
-    queries = ["ytsearchdate30:GTA 6", "ytsearch30:GTA 6", "ytsearchdate30:Grand Theft Auto VI", "ytsearch30:Grand Theft Auto VI"]
+    queries = ["ytsearch30:GTA 6", "ytsearch30:Grand Theft Auto VI"]
     for query in queries:
         command = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--no-progress", "-J", "--flat-playlist", "--playlist-end", "30", query]
         say("Fallback search: " + query)
@@ -566,9 +599,11 @@ def main() -> int:
             say("Live stream did not produce a publishable clip; trying recorded videos: " + str(exc))
 
     # VOD fallback: first 24 hours, then 7 days, then 30 days if the GTA 6 upload window is quiet.
-    youtube_probe()
+    youtube_ok = youtube_probe()
     sources: list[dict[str, str]] = []
     for hours in (24, 168, 720):
+        if not youtube_ok:
+            break
         try:
             run([sys.executable, "scripts/trends.py", "--query", "GTA 6", "--hours", str(hours), "--limit", "30", "--out", "trends.md"], timeout=300)
             sources = parse_trends(ROOT / "trends.md")
@@ -579,12 +614,15 @@ def main() -> int:
             say(f"Found {len(sources)} candidate videos in the last {hours} hours.")
             break
         say(f"No videos found in the last {hours} hours; widening the search.")
-    if not sources:
+    if not sources and youtube_ok:
         sources = ytsearch_fallback()
+    if not youtube_ok:
+        say("YouTube is blocking this runner, so YouTube videos are skipped; using Twitch clips instead.")
+    sources = sources[:5] + twitch_clip_sources(live_sources)
     if not sources:
-        raise RuntimeError("The original trend search and the built-in YouTube search found no usable GTA 6 videos or live clips. No content was published.")
+        raise RuntimeError("No usable GTA 6 videos or Twitch clips were found. No content was published.")
 
-    for source in sources[:5]:
+    for source in sources[:10]:
         url = source["url"]
         done = state["posted_sources"].get(url, [])
         if set(done) >= set(PLATFORMS):
