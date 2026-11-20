@@ -1,4 +1,23 @@
 {
-  "posted_sources": {},
-  "last_run": null
+  "posted_sources": {
+    "https://clips.twitch.tv/SuccessfulSnappyDiamondPastaThat-xNRFdR22plJFfA7H": [
+      "youtube",
+      "facebook",
+      "instagram",
+      "tiktok"
+    ],
+    "https://clips.twitch.tv/DoubtfulRacyAnisePMSTwin-_hVBLJq-mpTldJyL": [
+      "youtube",
+      "facebook",
+      "instagram",
+      "tiktok"
+    ],
+    "https://clips.twitch.tv/SpeedyUnusualAnacondaPMSTwin-pWR3WWSLfGZmTHlN": [
+      "youtube",
+      "facebook",
+      "instagram",
+      "tiktok"
+    ]
+  },
+  "last_run": "2026-11-20T20:29:46Z"
 }
