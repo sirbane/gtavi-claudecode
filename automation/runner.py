@@ -128,14 +128,18 @@ def execute_tool(account: dict[str, Any], slug: str, arguments: dict[str, Any], 
     return result.get("data") or {}
 
 def stage_video(path: Path, toolkit: str, tool_slug: str) -> dict[str, str]:
-    digest = hashlib.md5(path.read_bytes()).hexdigest()
+    digestor = hashlib.md5()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digestor.update(chunk)
     request_data = api_post("/files/upload/request", {
         "toolkit_slug": toolkit,
         "tool_slug": tool_slug,
         "filename": path.name,
         "mimetype": "video/mp4",
-        "md5": digest,
+        "md5": digestor.hexdigest(),
     })
+    request_data = request_data.get("data") if isinstance(request_data.get("data"), dict) else request_data
     upload_url = request_data.get("new_presigned_url") or request_data.get("newPresignedUrl")
     s3key = request_data.get("key")
     if not upload_url or not s3key:
@@ -147,9 +151,9 @@ def stage_video(path: Path, toolkit: str, tool_slug: str) -> dict[str, str]:
     return {"name": path.name, "mimetype": "video/mp4", "s3key": s3key}
 
 def nested_payload(result: dict[str, Any]) -> dict[str, Any]:
-    # Composio actions commonly wrap provider data one level inside "data".
+    # Keep provider responses such as Facebook's {data: [...], paging: ...} intact.
     value = result.get("data", result)
-    return value if isinstance(value, dict) else {}
+    return value if isinstance(value, dict) else result
 
 def get_instagram_id(account: dict[str, Any]) -> str:
     result = execute_tool(account, "INSTAGRAM_GET_USER_INFO", {"ig_user_id": "me", "fields": "id,username"})
@@ -284,7 +288,28 @@ def publish_one(clip: Path, source: dict[str, Any], destinations: dict[str, Any]
                 "privacy_level": "PUBLIC_TO_EVERYONE",
                 "is_aigc": False,
             }, timeout=600)
-            say("TikTok publishing request accepted: " + json.dumps(result)[:600])
+            status_data = nested_payload(result)
+            publish_id = status_data.get("publish_id")
+            if not publish_id:
+                raise RuntimeError(f"TikTok did not return a publish ID: {result}")
+            delay = 5
+            final_status = ""
+            for attempt in range(5):
+                time.sleep(delay)
+                status_result = execute_tool(
+                    destinations["tiktok"], "TIKTOK_FETCH_PUBLISH_STATUS",
+                    {"publish_id": str(publish_id)}, timeout=90
+                )
+                status_payload = nested_payload(status_result)
+                final_status = str(status_payload.get("status") or "")
+                say(f"TikTok processing status: {final_status or 'not returned'}")
+                if final_status == "PUBLISH_COMPLETE":
+                    break
+                if final_status in {"FAILED", "PUBLISH_FAILED"}:
+                    raise RuntimeError(f"TikTok rejected the video: {status_payload.get('fail_reason', final_status)}")
+                delay = min(delay * 2, 30)
+            if final_status != "PUBLISH_COMPLETE":
+                raise RuntimeError(f"TikTok is not confirmed published yet (status: {final_status or 'unknown'}). It will be retried on a later run only if safe.")
             succeeded.append("tiktok")
         except Exception as exc:
             say("TikTok publishing failed: " + str(exc))
@@ -379,7 +404,11 @@ def main() -> int:
         if set(done) >= set(PLATFORMS):
             say("Already posted to all four platforms; skipping " + url)
             continue
-        made = make_clip(source)
+        try:
+            made = make_clip(source)
+        except Exception as exc:
+            say("Could not process this source; trying the next trend: " + str(exc))
+            continue
         if not made:
             say("No usable moment found in " + url)
             continue
