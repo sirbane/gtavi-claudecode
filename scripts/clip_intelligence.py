@@ -4,6 +4,7 @@
 Commands
   plan <clip_id> <transcript.txt> [--duration S]   AI editing plan saved to DB
   plan-all [--jobs-dir jobs]                       plan every jobs/*/candidates.md not yet planned
+  sync                                             auto-register every Reel on the Facebook Page (via Composio)
   register <clip_id> <fb_video_id> [--hook X] [--version A] [--experiment E] [--duration S]
   snapshot                                         Facebook insights at 1h/6h/24h/72h/7d (append-only)
   report                                           per-clip diagnosis + decision (respects MIN_PLAYS)
@@ -52,7 +53,7 @@ def db():
     c.row_factory = sqlite3.Row
     c.executescript("""
     CREATE TABLE IF NOT EXISTS clips(
-      clip_id TEXT PRIMARY KEY, fb_video_id TEXT, hook_type TEXT, duration REAL,
+      clip_id TEXT PRIMARY KEY, label TEXT, fb_video_id TEXT, hook_type TEXT, duration REAL,
       edit_version TEXT, experiment_id TEXT, published_at TEXT, plan_json TEXT);
     CREATE TABLE IF NOT EXISTS snapshots(
       id INTEGER PRIMARY KEY AUTOINCREMENT, clip_id TEXT, taken_at TEXT, hours_after INTEGER,
@@ -119,14 +120,73 @@ def cmd_register(a):
               (a.clip_id, a.fb_video_id, a.hook, a.duration, a.version, a.experiment, datetime.now(timezone.utc).isoformat()))
     c.commit()
 
+COMPOSIO_BASE = "https://backend.composio.dev/api/v3.1"
+_PAGE = {}
+
+def _ch():
+    return {"x-api-key": env("COMPOSIO_API_KEY"), "Content-Type": "application/json"}
+
+def _exec(acc, slug, args):
+    r = requests.post(f"{COMPOSIO_BASE}/tools/execute/{slug}", headers=_ch(), timeout=120,
+                      json={"connected_account_id": acc["id"], "user_id": acc.get("user_id"),
+                            "version": "latest", "arguments": args})
+    r.raise_for_status()
+    d = r.json()
+    if d.get("successful") is False:
+        raise RuntimeError(d.get("error") or d)
+    d = d.get("data") or {}
+    return d.get("data", d) if isinstance(d, dict) else d
+
+def fb_page():
+    """Find the Facebook Page through the Composio connection; its page token never needs a Meta app."""
+    if _PAGE:
+        return _PAGE["acc"], _PAGE["id"], _PAGE["token"]
+    name = (env("FACEBOOK_PAGE_NAME") or "CrimeScene VI").lower()
+    r = requests.get(f"{COMPOSIO_BASE}/connected_accounts", headers=_ch(), params={"limit": 100}, timeout=45)
+    r.raise_for_status()
+    for acc in r.json().get("items") or []:
+        if str((acc.get("toolkit") or {}).get("slug", "")).lower() != "facebook" or str(acc.get("status", "")).upper() != "ACTIVE":
+            continue
+        try:
+            for pg in _exec(acc, "FACEBOOK_LIST_MANAGED_PAGES", {"limit": 100, "fields": "id,name,access_token"}):
+                if str(pg.get("name", "")).strip().lower() == name and pg.get("access_token"):
+                    _PAGE.update(acc=acc, id=str(pg["id"]), token=pg["access_token"])
+                    return acc, _PAGE["id"], _PAGE["token"]
+        except Exception as e:
+            print("facebook connection check:", e)
+    raise RuntimeError("Facebook Page not found through Composio connections")
+
 def fetch_insights(video_id):
-    """Swap this one function for a Composio call if preferred; keep the returned dict shape."""
+    """Graph API video_insights using the page token Composio already holds. Metric names are in METRIC_MAP."""
     mm = json.loads(env("METRIC_MAP"))
+    _, _, token = fb_page()
     r = requests.get(f"https://graph.facebook.com/{env('GRAPH_VERSION')}/{video_id}/video_insights",
-                     params={"metric": ",".join(mm.values()), "access_token": env("FB_PAGE_TOKEN")}, timeout=60)
+                     params={"metric": ",".join(mm.values()), "access_token": token}, timeout=60)
     r.raise_for_status()
     got = {d["name"]: (d["values"][0]["value"] if d.get("values") else None) for d in r.json().get("data", [])}
-    return {k: got.get(v) for k, v in mm.items()}
+    out = {k: got.get(v) for k, v in mm.items()}
+    if out.get("avg_watch_s") is not None:
+        out["avg_watch_s"] = out["avg_watch_s"] / 1000.0   # Facebook reports milliseconds
+    return out
+
+def cmd_sync(_a=None):
+    """Register every Reel on the Page automatically (no manual register step)."""
+    if not env("COMPOSIO_API_KEY"):
+        print("COMPOSIO_API_KEY not set - skipping sync"); return
+    acc, page_id, _ = fb_page()
+    vids = _exec(acc, "FACEBOOK_GET_PAGE_VIDEOS", {"page_id": page_id, "limit": 50, "fields": "id,created_time,description,length"})
+    c = db(); new = 0
+    for v in vids if isinstance(vids, list) else []:
+        cid = f"fb_{v['id']}"
+        if c.execute("SELECT 1 FROM clips WHERE clip_id=?", (cid,)).fetchone():
+            continue
+        ts = datetime.strptime(v["created_time"], "%Y-%m-%dT%H:%M:%S%z").isoformat()
+        label = ((v.get("description") or "").split("\n")[0])[:60]
+        c.execute("INSERT INTO clips(clip_id,label,fb_video_id,duration,published_at) VALUES(?,?,?,?,?)",
+                  (cid, label, v["id"], v.get("length"), ts))
+        new += 1
+    c.commit()
+    print(f"synced {new} new Page videos")
 
 def normalize_curve(raw):
     if not raw:
@@ -138,8 +198,8 @@ def normalize_curve(raw):
     return cur
 
 def cmd_snapshot(_a=None):
-    if not env("FB_PAGE_TOKEN"):
-        print("FB_PAGE_TOKEN not set - skipping Facebook snapshots"); return
+    if not env("COMPOSIO_API_KEY"):
+        print("COMPOSIO_API_KEY not set - skipping Facebook snapshots"); return
     c = db(); now = datetime.now(timezone.utc)
     marks = [int(x) for x in env("SNAPSHOT_HOURS").split(",")]
     for clip in c.execute("SELECT * FROM clips WHERE fb_video_id IS NOT NULL AND published_at IS NOT NULL").fetchall():
@@ -202,7 +262,7 @@ def cmd_report(_a=None):
         if not s:
             continue
         n += 1; m = analyse(clip, s)
-        print(f"{clip['clip_id']:<28} plays={m['plays']:<6} open@{env('OPEN_SECOND')}s={pct(m['ret_open'])} "
+        print(f"{(clip['label'] or clip['clip_id'])[:28]:<28} plays={m['plays']:<6} open@{env('OPEN_SECOND')}s={pct(m['ret_open'])} "
               f"avg={pct(m['avg_ret'])} bigdrop={m['drop_s']}s(-{m['drop']*100:.0f}%)\n   -> {decide(m)}")
     if not n:
         print("No clips with Facebook snapshots yet. Register published Reels with: register <clip_id> <fb_video_id>")
@@ -240,10 +300,10 @@ def main():
     x = sp.add_parser("plan-all"); x.add_argument("--jobs-dir", default="jobs")
     x = sp.add_parser("register"); x.add_argument("clip_id"); x.add_argument("fb_video_id")
     x.add_argument("--hook"); x.add_argument("--version"); x.add_argument("--experiment"); x.add_argument("--duration", type=float)
-    sp.add_parser("snapshot"); sp.add_parser("report"); sp.add_parser("guidelines")
+    sp.add_parser("snapshot"); sp.add_parser("sync"); sp.add_parser("report"); sp.add_parser("guidelines")
     x = sp.add_parser("compare"); x.add_argument("experiment_id")
     a = p.parse_args()
-    {"plan": cmd_plan, "plan-all": cmd_plan_all, "register": cmd_register, "snapshot": cmd_snapshot,
+    {"plan": cmd_plan, "plan-all": cmd_plan_all, "register": cmd_register, "sync": cmd_sync, "snapshot": cmd_snapshot,
      "report": cmd_report, "guidelines": cmd_guidelines, "compare": cmd_compare}[a.cmd](a)
 
 if __name__ == "__main__":
