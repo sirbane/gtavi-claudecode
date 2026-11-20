@@ -327,6 +327,38 @@ def parse_trends(path: Path) -> list[dict[str, str]]:
     return rows
 
 
+
+def ytsearch_fallback() -> list[dict[str, str]]:
+    """Fallback to yt-dlp's built-in YouTube search if the original trend URL returns no entries."""
+    queries = ["ytsearchdate30:GTA 6", "ytsearch30:GTA 6", "ytsearchdate30:Grand Theft Auto VI", "ytsearch30:Grand Theft Auto VI"]
+    for query in queries:
+        command = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--no-progress", "-J", "--flat-playlist", "--playlist-end", "30", query]
+        say("Fallback search: " + query)
+        result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        if result.returncode != 0 or not result.stdout.strip():
+            say("Fallback search returned no result: " + (result.stderr or "no output")[-500:])
+            continue
+        try:
+            payload = json.loads(result.stdout)
+        except Exception as exc:
+            say("Could not read fallback search results: " + str(exc))
+            continue
+        rows = []
+        for entry in payload.get("entries") or []:
+            if not entry:
+                continue
+            video_url = entry.get("webpage_url") or entry.get("url") or ""
+            video_id = entry.get("id") or ""
+            if not video_url.startswith("http") and video_id:
+                video_url = "https://www.youtube.com/watch?v=" + video_id
+            if video_url.startswith("http"):
+                rows.append({"title": entry.get("title") or "GTA 6 video", "url": video_url, "channel": entry.get("channel") or entry.get("uploader") or ""})
+        if rows:
+            say(f"Built-in YouTube search found {len(rows)} candidate videos.")
+            return rows
+    return []
+
+
 def parse_streams(path: Path) -> list[dict[str, str]]:
     if not path.exists():
         return []
@@ -407,19 +439,20 @@ def main() -> int:
 
     # Scheduled runs first watch a live stream for chat spikes, using the original live.py recorder.
     live_sources: list[dict[str, str]] = []
-    if not DRY_RUN:
-        try:
-            run([sys.executable, "scripts/streams.py", "--query", "GTA 6", "--limit", "10", "--out", "streams.md"], timeout=600)
-            live_sources = parse_streams(ROOT / "streams.md")
-        except Exception as exc:
-            say("Live-stream discovery was unavailable; falling back to recent videos: " + str(exc))
+    try:
+        run([sys.executable, "scripts/streams.py", "--query", "GTA 6", "--limit", "10", "--out", "streams.md"], timeout=600)
+        live_sources = parse_streams(ROOT / "streams.md")
+        say(f"Live-stream search returned {len(live_sources)} possible streams.")
+    except Exception as exc:
+        say("Live-stream discovery was unavailable; falling back to recorded videos: " + str(exc))
 
     for live_source in live_sources[:2]:
         url = live_source["url"]
         if set(state["posted_sources"].get(url, [])) >= set(PLATFORMS):
             continue
         try:
-            run([sys.executable, "scripts/live.py", url, "--minutes", "12"], timeout=1000)
+            capture_minutes = "2" if DRY_RUN else "12"
+            run([sys.executable, "scripts/live.py", url, "--minutes", capture_minutes], timeout=1000)
             live_folder = job_folder_for(url) / "live"
             spikes = sorted(live_folder.glob("spike_*.mp4"))
             for spike in spikes:
@@ -452,7 +485,9 @@ def main() -> int:
             break
         say(f"No videos found in the last {hours} hours; widening the search.")
     if not sources:
-        raise RuntimeError("No recent GTA 6 videos or live-stream clips were found. No content was published.")
+        sources = ytsearch_fallback()
+    if not sources:
+        raise RuntimeError("The original trend search and the built-in YouTube search found no usable GTA 6 videos or live clips. No content was published.")
 
     for source in sources[:5]:
         url = source["url"]
