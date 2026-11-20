@@ -326,6 +326,31 @@ def parse_trends(path: Path) -> list[dict[str, str]]:
             rows.append({"title": match.group(1).strip(), "url": match.group(2).strip(), "channel": ""})
     return rows
 
+
+def parse_streams(path: Path) -> list[dict[str, str]]:
+    if not path.exists():
+        return []
+    rows: list[dict[str, str]] = []
+    pattern = re.compile(r"^\|\s*\d+\s*\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*([^|]+)\|\s*(https?://[^|]+)\s*\|", re.I)
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        match = pattern.search(line)
+        if match:
+            rows.append({"channel": match.group(1).strip(), "title": match.group(2).strip(), "viewers": match.group(3).strip(), "url": match.group(5).strip()})
+    return rows
+
+
+def job_folder_for(source_path: str) -> Path:
+    import hashlib
+    from urllib.parse import urlparse
+    if source_path.startswith(("http://", "https://")):
+        stem_source = source_path.split("v=")[-1].split("/")[-1].lower()
+    else:
+        stem_source = Path(source_path).stem.lower()
+    stem = re.sub(r"[^a-z0-9]+", "-", stem_source)[:24].strip("-") or "job"
+    key = hashlib.sha1(source_path.encode()).hexdigest()[:8]
+    return ROOT / "jobs" / f"{stem}-{key}"
+
+
 def build_caption(source: dict[str, Any], candidate: dict[str, Any]) -> str:
     channel = source.get("channel") or "the original creator"
     title = source.get("title") or "GTA 6"
@@ -335,20 +360,9 @@ def build_caption(source: dict[str, Any], candidate: dict[str, Any]) -> str:
     return (hook[:52] if hook else "GTA 6 moment")
 
 def make_clip(source: dict[str, str]) -> tuple[Path, dict[str, Any]] | None:
-    job = ROOT / "jobs"
-    before = {p.resolve() for p in job.glob("*")} if job.exists() else set()
-    run([sys.executable, "scripts/moments.py", source["url"], "--top", "5", "--min", "15", "--max", "40", "--max-minutes", "25"], timeout=5400)
-    after = [p for p in job.glob("*") if p.resolve() not in before]
-    # job_dir is deterministic, so it can already exist from an earlier failed attempt.
-    if not after:
-        import hashlib
-        from urllib.parse import urlparse, parse_qs
-        video_id = parse_qs(urlparse(source["url"]).query).get("v", [""])[0]
-        stem = re.sub(r"[^a-z0-9]+", "-", video_id.lower())[:24].strip("-") or "job"
-        key = hashlib.sha1(source["url"].encode()).hexdigest()[:8]
-        folder = job / f"{stem}-{key}"
-    else:
-        folder = after[-1]
+    source_path = source.get("local_file") or source["url"]
+    folder = job_folder_for(source_path)
+    run([sys.executable, "scripts/moments.py", source_path, "--top", "5", "--min", "15", "--max", "40", "--max-minutes", "25"], timeout=5400)
     candidates_path = folder / "candidates.json"
     if not candidates_path.exists():
         raise RuntimeError(f"The original moment finder did not create {candidates_path}.")
@@ -360,44 +374,86 @@ def make_clip(source: dict[str, str]) -> tuple[Path, dict[str, Any]] | None:
     if float(best.get("score") or 0) <= 0:
         return None
     hook = build_caption(source, best)
-    run([
-        sys.executable, "scripts/cut.py", str(folder), "--pick", str(best["n"]),
-        "--layout", "blur", "--hook", hook, "--captions", "word"
-    ], timeout=3600)
+    run([sys.executable, "scripts/cut.py", str(folder), "--pick", str(best["n"]), "--layout", "blur", "--hook", hook, "--captions", "word"], timeout=3600)
     clip = folder / "edits" / f"clip_{best['n']}.mp4"
     if not clip.exists():
         raise RuntimeError("The original clip cutter did not produce an MP4.")
-    # Keep original source attribution in the cutter's sidecar metadata.
     sidecar = clip.with_suffix(".json")
     meta = json.loads(sidecar.read_text(encoding="utf-8")) if sidecar.exists() else {}
     info = data.get("info") or {}
-    source.update({
-        "title": info.get("title") or source.get("title") or "GTA 6 moment",
-        "channel": info.get("channel") or info.get("uploader") or source.get("channel") or "Original creator",
-    })
+    if not source.get("local_file"):
+        source.update({"title": info.get("title") or source.get("title") or "GTA 6 moment", "channel": info.get("channel") or info.get("uploader") or source.get("channel") or "Original creator"})
+    else:
+        source["title"] = source.get("title") or "GTA 6 live-stream moment"
+        source["channel"] = source.get("channel") or "Original creator"
     meta.update({"source_url": source["url"], "source_title": source["title"], "source_channel": source["channel"]})
     sidecar.write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    caption = (
-        f"{source['title']}\n\nOriginal creator: {source['channel']}\n"
-        f"Source: {source['url']}\n#GTA6 #GTAVI #CrimeSceneSix #Shorts"
-    )
+    caption = f"{source['title']}\n\nOriginal creator: {source['channel']}\nSource: {source['url']}\n#GTA6 #GTAVI #CrimeSceneSix #Shorts"
     run([sys.executable, "scripts/check.py", str(clip), "--caption", caption], timeout=120)
     return clip, source
+
 
 def main() -> int:
     ARTIFACTS.mkdir(parents=True, exist_ok=True)
     state = load_state()
+    state.setdefault("posted_sources", {})
     say("Crime Scene Six automation starting.")
     say("Mode: " + ("TEST ONLY, nothing will be published." if DRY_RUN else "AUTOMATIC PUBLICATION ENABLED."))
-    run([sys.executable, "scripts/trends.py", "--query", "GTA 6", "--hours", "24", "--limit", "20", "--out", "trends.md"], timeout=900)
-    sources = parse_trends(ROOT / "trends.md")
-    if not sources:
-        raise RuntimeError("The original trend finder returned no usable recent GTA 6 videos.")
     destinations = None
     if not DRY_RUN:
         accounts = connected_accounts()
         say("Active Composio connections visible to this API key: " + ", ".join(sorted({toolkit_slug(x) for x in accounts})))
         destinations = verify_destinations(accounts)
+
+    # Scheduled runs first watch a live stream for chat spikes, using the original live.py recorder.
+    live_sources: list[dict[str, str]] = []
+    if not DRY_RUN:
+        try:
+            run([sys.executable, "scripts/streams.py", "--query", "GTA 6", "--limit", "10", "--out", "streams.md"], timeout=600)
+            live_sources = parse_streams(ROOT / "streams.md")
+        except Exception as exc:
+            say("Live-stream discovery was unavailable; falling back to recent videos: " + str(exc))
+
+    for live_source in live_sources[:2]:
+        url = live_source["url"]
+        if set(state["posted_sources"].get(url, [])) >= set(PLATFORMS):
+            continue
+        try:
+            run([sys.executable, "scripts/live.py", url, "--minutes", "12"], timeout=1000)
+            live_folder = job_folder_for(url) / "live"
+            spikes = sorted(live_folder.glob("spike_*.mp4"))
+            for spike in spikes:
+                source = {"url": url, "local_file": str(spike.resolve()), "title": live_source.get("title") or "GTA 6 live-stream moment", "channel": live_source.get("channel") or "Original creator"}
+                made = make_clip(source)
+                if not made:
+                    continue
+                clip, source = made
+                target = ARTIFACTS / clip.name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(clip.read_bytes())
+                done = state["posted_sources"].get(url, [])
+                if DRY_RUN:
+                    say(f"TEST COMPLETE: prepared live clip {clip}. No posts were made.")
+                    return 0
+                succeeded = publish_one(clip, source, destinations, done)
+                state["posted_sources"][url] = sorted(set(done + succeeded))
+                save_state(state)
+                return 0 if succeeded else 1
+        except Exception as exc:
+            say("Live stream did not produce a publishable clip; trying recorded videos: " + str(exc))
+
+    # VOD fallback: first 24 hours, then 7 days, then 30 days if the GTA 6 upload window is quiet.
+    sources: list[dict[str, str]] = []
+    for hours in (24, 168, 720):
+        run([sys.executable, "scripts/trends.py", "--query", "GTA 6", "--hours", str(hours), "--limit", "30", "--out", "trends.md"], timeout=900)
+        sources = parse_trends(ROOT / "trends.md")
+        if sources:
+            say(f"Found {len(sources)} candidate videos in the last {hours} hours.")
+            break
+        say(f"No videos found in the last {hours} hours; widening the search.")
+    if not sources:
+        raise RuntimeError("No recent GTA 6 videos or live-stream clips were found. No content was published.")
+
     for source in sources[:5]:
         url = source["url"]
         done = state["posted_sources"].get(url, [])
