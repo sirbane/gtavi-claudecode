@@ -205,6 +205,8 @@ def cmd_snapshot(_a=None):
     for clip in c.execute("SELECT * FROM clips WHERE fb_video_id IS NOT NULL AND published_at IS NOT NULL").fetchall():
         age = (now - datetime.fromisoformat(clip["published_at"])).total_seconds() / 3600
         done = {r[0] for r in c.execute("SELECT hours_after FROM snapshots WHERE clip_id=?", (clip["clip_id"],))}
+        if done:
+            done |= {m for m in marks if m <= max(done)}   # a later snapshot already covers earlier marks
         due = [m for m in marks if age >= m and m not in done]
         if not due:
             continue
