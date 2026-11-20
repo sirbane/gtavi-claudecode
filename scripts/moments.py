@@ -21,7 +21,8 @@ def fetch(src, d, max_min):
     if is_url(src):
         info = ytdlp_json(src)
         save_json(d / "info.json", {k: info.get(k) for k in ("id", "title", "uploader", "channel", "uploader_id", "webpage_url",
-                                                             "duration", "view_count", "upload_date", "heatmap", "is_live", "was_live")})
+                                                             "duration", "view_count", "upload_date", "heatmap", "is_live", "was_live",
+                                                             "age_limit", "age_restricted", "is_age_restricted", "availability", "description")})
         vid = d / "source.mp4"
         if not vid.exists():
             args = ytdlp_base() + ["-f", "bv*[height<=1080][ext=mp4]+ba[ext=m4a]/b[height<=1080]/b", "--merge-output-format", "mp4",
