@@ -28,7 +28,8 @@ INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "crimescene_vi")
 YOUTUBE_CHANNEL_NAME = os.getenv("YOUTUBE_CHANNEL_NAME", "CrimeSceneVI")
 TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME", "scurotwo8")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1nFyqTryalnj57wRC3q75PZhiQdBDcFvN")
-DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
+DRY_RUN = True  # clip-only mode: Composio, Google Drive upload and social posting are removed
+MAX_CLIPS_PER_RUN = 3
 PLATFORMS = ("youtube", "facebook", "instagram", "tiktok")
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "CrimeSceneSix-AutoClipper/1.0"})
@@ -188,11 +189,32 @@ def get_facebook_page(accounts: list[dict[str, Any]]) -> tuple[dict[str, Any], s
         f"Could not find the Facebook Page '{FACEBOOK_PAGE_NAME}' in the connected Facebook accounts."
     )
 
+def pick_drive_account(accounts: list[dict[str, Any]]) -> dict[str, Any]:
+    """Pick the Google Drive connection that can write to the clipping folder (several may be connected)."""
+    candidates = [a for a in accounts if toolkit_slug(a) == "googledrive" and a.get("id")]
+    if not candidates:
+        raise RuntimeError("No active googledrive connection is visible to this Composio API key.")
+    reasons: list[str] = []
+    for account in candidates:
+        try:
+            meta = nested_payload(execute_tool(account, "GOOGLEDRIVE_GET_FILE_METADATA", {
+                "file_id": GOOGLE_DRIVE_FOLDER_ID,
+                "fields": "id,name,mimeType,trashed,capabilities/canAddChildren",
+            }))
+            can_add = (meta.get("capabilities") or {}).get("canAddChildren", True)
+            if meta.get("mimeType") == "application/vnd.google-apps.folder" and not meta.get("trashed") and can_add:
+                say(f"Google Drive folder '{meta.get('name')}' is reachable and writable.")
+                return account
+            reasons.append(f"{account.get('id')}: not a writable folder")
+        except Exception as exc:
+            reasons.append(f"{account.get('id')}: {str(exc)[:160]}")
+    raise RuntimeError("No connected Google Drive account can write to folder " + GOOGLE_DRIVE_FOLDER_ID + " (" + "; ".join(reasons) + ")")
+
 def verify_destinations(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     youtube = account_for(accounts, "youtube")
     tiktok = account_for(accounts, "tiktok")
     instagram = account_for(accounts, "instagram")
-    drive = account_for(accounts, "googledrive")
+    drive = pick_drive_account(accounts)
     facebook, page_id = get_facebook_page(accounts)
 
     creator = nested_payload(execute_tool(tiktok, "TIKTOK_QUERY_CREATOR_INFO", {}))
@@ -231,6 +253,21 @@ def upload_clip_to_drive(clip: Path, drive_account: dict[str, Any]) -> dict[str,
     }, timeout=900)
     say("Uploaded finished clip to Google Drive GPT clipping: " + json.dumps(result)[:700])
     return result
+
+def drive_archive(clip: Path, destinations: dict[str, Any] | None) -> None:
+    if not destinations or not destinations.get("googledrive"):
+        say("Google Drive archive skipped: Composio destinations are not verified in this run.")
+        return
+    try:
+        upload_clip_to_drive(clip, destinations["googledrive"])
+    except Exception as exc:
+        if DRY_RUN:
+            raise
+        say("GOOGLE DRIVE ARCHIVE FAILED (publishing continues): " + str(exc))
+
+def finish_test(destination_error: str) -> int:
+    say("DONE. Finished clips are in artifacts/ and attached to this run as a downloadable zip.")
+    return 0
 
 def publish_one(clip: Path, source: dict[str, Any], destinations: dict[str, Any], already: list[str]) -> list[str]:
     title = str(source.get("title") or "GTA 6 moment").strip()
@@ -349,13 +386,65 @@ def parse_trends(path: Path) -> list[dict[str, str]]:
 
 
 
+def youtube_probe() -> bool:
+    """Print whether YouTube lets this runner read video metadata (datacenter IPs are often blocked)."""
+    command = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--skip-download", "--socket-timeout", "15",
+               "--print", "%(id)s | %(title)s", "https://www.youtube.com/watch?v=jNQXAC9IVRw"]
+    try:
+        result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+    except subprocess.TimeoutExpired:
+        say("YouTube reachability probe: TIMED OUT")
+        return False
+    if result.returncode == 0:
+        say("YouTube reachability probe: OK (" + (result.stdout or "").strip()[:120] + ")")
+        return True
+    say("YouTube reachability probe: BLOCKED/FAILED -> " + ((result.stderr or result.stdout or "no output").strip()[-700:]))
+    return False
+
+TWITCH_GQL = "https://gql.twitch.tv/gql"
+TWITCH_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko"  # public web Client-Id, same one the repo's twitch.py uses
+TWITCH_CLIPS_QUERY = """query($login:String!,$n:Int!){ user(login:$login){ displayName clips(first:$n, criteria:{period:LAST_DAY, sort:VIEWS_DESC}){ edges{ node{ slug title viewCount durationSeconds game{ name } broadcaster{ displayName login } } } } } }"""
+
+def twitch_clip_sources(streams: list[dict[str, str]], max_channels: int = 5, per_channel: int = 8) -> list[dict[str, str]]:
+    """Top GTA 6 clips of the last 24h from the streamers we already found. Twitch works from GitHub runners; YouTube does not."""
+    rows: list[dict[str, Any]] = []
+    for stream in streams[:max_channels]:
+        login = (stream.get("url") or "").rstrip("/").split("/")[-1].lower()
+        if not login:
+            continue
+        try:
+            response = SESSION.post(TWITCH_GQL, json={"query": TWITCH_CLIPS_QUERY, "variables": {"login": login, "n": per_channel}},
+                                    headers={"Client-Id": TWITCH_CLIENT_ID}, timeout=20)
+            response.raise_for_status()
+            user = ((response.json().get("data") or {}).get("user")) or {}
+        except Exception as exc:
+            say(f"Twitch clips lookup failed for {login}: {exc}")
+            continue
+        for edge in ((user.get("clips") or {}).get("edges") or []):
+            node = edge.get("node") or {}
+            game = ((node.get("game") or {}).get("name") or "").lower()
+            if not node.get("slug") or float(node.get("durationSeconds") or 0) < 18:
+                continue
+            if game and not ("grand theft" in game or "gta" in game):
+                continue
+            rows.append({"title": node.get("title") or "GTA 6 clip", "url": "https://clips.twitch.tv/" + node["slug"],
+                         "channel": (node.get("broadcaster") or {}).get("displayName") or login,
+                         "views": int(node.get("viewCount") or 0)})
+    rows.sort(key=lambda item: item["views"], reverse=True)
+    say(f"Twitch top clips of the last 24h: {len(rows)} usable clips from {min(len(streams), max_channels)} channels.")
+    return [{k: v for k, v in item.items() if k != "views"} for item in rows]
+
 def ytsearch_fallback() -> list[dict[str, str]]:
     """Fallback to yt-dlp's built-in YouTube search if the original trend URL returns no entries."""
-    queries = ["ytsearchdate30:GTA 6", "ytsearch30:GTA 6", "ytsearchdate30:Grand Theft Auto VI", "ytsearch30:Grand Theft Auto VI"]
+    queries = ["ytsearch30:GTA 6", "ytsearch30:Grand Theft Auto VI"]
     for query in queries:
         command = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--no-progress", "-J", "--flat-playlist", "--playlist-end", "30", query]
         say("Fallback search: " + query)
-        result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        try:
+            result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+        except subprocess.TimeoutExpired:
+            say("Fallback search timed out: " + query)
+            continue
         if result.returncode != 0 or not result.stdout.strip():
             say("Fallback search returned no result: " + (result.stderr or "no output")[-500:])
             continue
@@ -453,12 +542,8 @@ def main() -> int:
     say("Crime Scene Six automation starting.")
     say("Mode: " + ("TEST ONLY, nothing will be published." if DRY_RUN else "AUTOMATIC PUBLICATION ENABLED."))
     destinations = None
-    if os.getenv("COMPOSIO_API_KEY", "").strip():
-        accounts = connected_accounts()
-        say("Active Composio connections visible to this API key: " + ", ".join(sorted({toolkit_slug(x) for x in accounts})))
-        destinations = verify_destinations(accounts)
-    elif not DRY_RUN:
-        raise RuntimeError("COMPOSIO_API_KEY is missing. Add it as a GitHub Actions secret before scheduled publishing can run.")
+    destination_error = ""
+    say("Clip-only mode: no Composio, no Drive upload, no posting. Finished clips are saved in artifacts/ and attached to this run.")
 
     # Scheduled runs first watch a live stream for chat spikes, using the original live.py recorder.
     live_sources: list[dict[str, str]] = []
@@ -474,7 +559,7 @@ def main() -> int:
         if set(state["posted_sources"].get(url, [])) >= set(PLATFORMS):
             continue
         try:
-            capture_minutes = "2" if DRY_RUN else "12"
+            capture_minutes = "5"
             run([sys.executable, "scripts/live.py", url, "--minutes", capture_minutes], timeout=1000)
             live_folder = job_folder_for(url) / "live"
             spikes = sorted(live_folder.glob("spike_*.mp4"))
@@ -484,15 +569,13 @@ def main() -> int:
                 if not made:
                     continue
                 clip, source = made
-                target = ARTIFACTS / clip.name
+                target = ARTIFACTS / f"{clip.parent.parent.name}_{clip.name}"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(clip.read_bytes())
-                if destinations and destinations.get("googledrive"):
-                    upload_clip_to_drive(clip, destinations["googledrive"])
                 done = state["posted_sources"].get(url, [])
                 if DRY_RUN:
-                    say(f"TEST COMPLETE: prepared live clip {clip}. No posts were made.")
-                    return 0
+                    say(f"CLIP READY (live stream moment): {target}")
+                    return finish_test(destination_error)
                 succeeded = publish_one(clip, source, destinations, done)
                 state["posted_sources"][url] = sorted(set(done + succeeded))
                 save_state(state)
@@ -501,20 +584,31 @@ def main() -> int:
             say("Live stream did not produce a publishable clip; trying recorded videos: " + str(exc))
 
     # VOD fallback: first 24 hours, then 7 days, then 30 days if the GTA 6 upload window is quiet.
+    youtube_ok = youtube_probe()
     sources: list[dict[str, str]] = []
     for hours in (24, 168, 720):
-        run([sys.executable, "scripts/trends.py", "--query", "GTA 6", "--hours", str(hours), "--limit", "30", "--out", "trends.md"], timeout=900)
-        sources = parse_trends(ROOT / "trends.md")
+        if not youtube_ok:
+            break
+        try:
+            run([sys.executable, "scripts/trends.py", "--query", "GTA 6", "--hours", str(hours), "--limit", "30", "--out", "trends.md"], timeout=300)
+            sources = parse_trends(ROOT / "trends.md")
+        except Exception as exc:
+            say(f"Trend search for the last {hours} hours failed or timed out: {exc}")
+            sources = []
         if sources:
             say(f"Found {len(sources)} candidate videos in the last {hours} hours.")
             break
         say(f"No videos found in the last {hours} hours; widening the search.")
-    if not sources:
+    if not sources and youtube_ok:
         sources = ytsearch_fallback()
+    if not youtube_ok:
+        say("YouTube is blocking this runner, so YouTube videos are skipped; using Twitch clips instead.")
+    sources = sources[:5] + twitch_clip_sources(live_sources)
     if not sources:
-        raise RuntimeError("The original trend search and the built-in YouTube search found no usable GTA 6 videos or live clips. No content was published.")
+        raise RuntimeError("No usable GTA 6 videos or Twitch clips were found. No content was published.")
 
-    for source in sources[:5]:
+    made_count = 0
+    for source in sources[:10]:
         url = source["url"]
         done = state["posted_sources"].get(url, [])
         if set(done) >= set(PLATFORMS):
@@ -529,15 +623,16 @@ def main() -> int:
             say("No usable moment found in " + url)
             continue
         clip, source = made
-        target = ARTIFACTS / clip.name
+        target = ARTIFACTS / f"{clip.parent.parent.name}_{clip.name}"
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(clip.read_bytes())
-        if destinations and destinations.get("googledrive"):
-            upload_clip_to_drive(clip, destinations["googledrive"])
-        if DRY_RUN:
-            say(f"TEST COMPLETE: prepared {clip} ({clip.stat().st_size:,} bytes). No posts were made.")
-            save_state(state)
-            return 0
+        say(f"CLIP READY: {target} ({clip.stat().st_size:,} bytes)")
+        state["posted_sources"][url] = list(PLATFORMS)
+        save_state(state)
+        made_count += 1
+        if made_count >= MAX_CLIPS_PER_RUN:
+            return finish_test(destination_error)
+        continue
         succeeded = publish_one(clip, source, destinations, done)
         state["posted_sources"][url] = sorted(set(done + succeeded))
         save_state(state)
@@ -547,7 +642,9 @@ def main() -> int:
         else:
             say("Some platforms remain pending. The next run will retry only the missing destinations.")
         return 0 if succeeded else 1
-    raise RuntimeError("No new eligible source produced a clip. No content was published.")
+    if made_count:
+        return finish_test(destination_error)
+    raise RuntimeError("No new eligible source produced a clip.")
 
 if __name__ == "__main__":
     try:
