@@ -39,15 +39,7 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
-      - name: Run discovery, clipping and publishing
-        env:
-          COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
-          GOOGLE_DRIVE_FOLDER_ID: "1nFyqTryalnj57wRC3q75PZhiQdBDcFvN"
-          FACEBOOK_PAGE_NAME: "CrimeScene VI"
-          INSTAGRAM_USERNAME: "crimescene_vi"
-          YOUTUBE_CHANNEL_NAME: "CrimeSceneVI"
-          TIKTOK_USERNAME: "scurotwo8"
-          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || 'false' }}
+      - name: Run discovery and clipping
         run: python automation/runner.py
 
       - name: Save clips and run report
@@ -62,7 +54,7 @@ jobs:
             jobs/*/candidates.md
             jobs/*/edits/*.mp4
           if-no-files-found: ignore
-          retention-days: 7
+          retention-days: 30
 
       - name: Save duplicate-prevention record
         if: success() && github.event_name == 'schedule'
