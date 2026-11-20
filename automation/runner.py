@@ -27,6 +27,7 @@ FACEBOOK_PAGE_NAME = os.getenv("FACEBOOK_PAGE_NAME", "CrimeScene VI")
 INSTAGRAM_USERNAME = os.getenv("INSTAGRAM_USERNAME", "crimescene_vi")
 YOUTUBE_CHANNEL_NAME = os.getenv("YOUTUBE_CHANNEL_NAME", "CrimeSceneVI")
 TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME", "scurotwo8")
+GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1nFyqTryalnj57wRC3q75PZhiQdBDcFvN")
 DRY_RUN = os.getenv("DRY_RUN", "false").lower() in {"1", "true", "yes"}
 PLATFORMS = ("youtube", "facebook", "instagram", "tiktok")
 SESSION = requests.Session()
@@ -191,6 +192,7 @@ def verify_destinations(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     youtube = account_for(accounts, "youtube")
     tiktok = account_for(accounts, "tiktok")
     instagram = account_for(accounts, "instagram")
+    drive = account_for(accounts, "googledrive")
     facebook, page_id = get_facebook_page(accounts)
 
     creator = nested_payload(execute_tool(tiktok, "TIKTOK_QUERY_CREATOR_INFO", {}))
@@ -209,7 +211,26 @@ def verify_destinations(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "youtube": youtube, "facebook": facebook, "facebook_page_id": page_id,
         "instagram": instagram, "instagram_user_id": ig_id, "tiktok": tiktok,
+        "googledrive": drive,
     }
+
+def upload_clip_to_drive(clip: Path, drive_account: dict[str, Any]) -> dict[str, Any]:
+    """Upload a finished MP4 to the dedicated Google Drive folder through Composio."""
+    if not GOOGLE_DRIVE_FOLDER_ID:
+        raise RuntimeError("GOOGLE_DRIVE_FOLDER_ID is missing; refusing to upload clips to Drive root.")
+    file_ref = stage_video(clip, "googledrive", "GOOGLEDRIVE_RESUMABLE_UPLOAD")
+    result = execute_tool(drive_account, "GOOGLEDRIVE_RESUMABLE_UPLOAD", {
+        "file_to_upload": file_ref,
+        "metadata": {
+            "name": clip.name,
+            "mimeType": "video/mp4",
+            "parents": [GOOGLE_DRIVE_FOLDER_ID],
+            "description": "Crime Scene Six automatically clipped video",
+        },
+        "folder_to_upload_to": GOOGLE_DRIVE_FOLDER_ID,
+    }, timeout=900)
+    say("Uploaded finished clip to Google Drive GPT clipping: " + json.dumps(result)[:700])
+    return result
 
 def publish_one(clip: Path, source: dict[str, Any], destinations: dict[str, Any], already: list[str]) -> list[str]:
     title = str(source.get("title") or "GTA 6 moment").strip()
@@ -466,6 +487,8 @@ def main() -> int:
                 target = ARTIFACTS / clip.name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_bytes(clip.read_bytes())
+                if destinations and destinations.get("googledrive"):
+                    upload_clip_to_drive(clip, destinations["googledrive"])
                 done = state["posted_sources"].get(url, [])
                 if DRY_RUN:
                     say(f"TEST COMPLETE: prepared live clip {clip}. No posts were made.")
@@ -509,6 +532,8 @@ def main() -> int:
         target = ARTIFACTS / clip.name
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_bytes(clip.read_bytes())
+        if destinations and destinations.get("googledrive"):
+            upload_clip_to_drive(clip, destinations["googledrive"])
         if DRY_RUN:
             say(f"TEST COMPLETE: prepared {clip} ({clip.stat().st_size:,} bytes). No posts were made.")
             save_state(state)

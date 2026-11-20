@@ -42,6 +42,7 @@ jobs:
       - name: Run discovery, clipping and publishing
         env:
           COMPOSIO_API_KEY: ${{ secrets.COMPOSIO_API_KEY }}
+          GOOGLE_DRIVE_FOLDER_ID: "1nFyqTryalnj57wRC3q75PZhiQdBDcFvN"
           FACEBOOK_PAGE_NAME: "CrimeScene VI"
           INSTAGRAM_USERNAME: "crimescene_vi"
           YOUTUBE_CHANNEL_NAME: "CrimeSceneVI"
