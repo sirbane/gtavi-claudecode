@@ -440,7 +440,7 @@ def main() -> int:
     # Scheduled runs first watch a live stream for chat spikes, using the original live.py recorder.
     live_sources: list[dict[str, str]] = []
     try:
-        run([sys.executable, "scripts/streams.py", "--query", "GTA 6", "--limit", "10", "--out", "streams.md"], timeout=600)
+        run([sys.executable, "scripts/streams.py", "--query", "GTA 6", "--limit", "5", "--out", "streams.md"], timeout=180)
         live_sources = parse_streams(ROOT / "streams.md")
         say(f"Live-stream search returned {len(live_sources)} possible streams.")
     except Exception as exc:

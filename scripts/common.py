@@ -25,7 +25,7 @@ def run(cmd, check=True, capture=False):
 def ytdlp_base():
     import importlib.util
     exe = [sys.executable, "-m", "yt_dlp"] if importlib.util.find_spec("yt_dlp") else [tool("yt-dlp")]
-    base = exe + ["--no-warnings", "--no-progress"]
+    base = exe + ["--no-warnings", "--no-progress", "--socket-timeout", "15"]
     if sys.platform == "win32":
         base += ["--compat-options", "no-certifi"]  # use the Windows certificate store
     return base
