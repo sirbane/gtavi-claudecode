@@ -39,6 +39,10 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt
 
+      - name: Find live clipping campaigns
+        continue-on-error: true
+        run: python scripts/campaigns.py
+
       - name: Run discovery and clipping
         run: python automation/runner.py
 
@@ -49,6 +53,7 @@ jobs:
           name: crime-scene-six-run-${{ github.run_number }}
           path: |
             artifacts/
+            campaigns.md
             trends.md
             streams.md
             jobs/*/candidates.md
