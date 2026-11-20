@@ -432,10 +432,12 @@ def main() -> int:
     say("Crime Scene Six automation starting.")
     say("Mode: " + ("TEST ONLY, nothing will be published." if DRY_RUN else "AUTOMATIC PUBLICATION ENABLED."))
     destinations = None
-    if not DRY_RUN:
+    if os.getenv("COMPOSIO_API_KEY", "").strip():
         accounts = connected_accounts()
         say("Active Composio connections visible to this API key: " + ", ".join(sorted({toolkit_slug(x) for x in accounts})))
         destinations = verify_destinations(accounts)
+    elif not DRY_RUN:
+        raise RuntimeError("COMPOSIO_API_KEY is missing. Add it as a GitHub Actions secret before scheduled publishing can run.")
 
     # Scheduled runs first watch a live stream for chat spikes, using the original live.py recorder.
     live_sources: list[dict[str, str]] = []
