@@ -19,6 +19,8 @@ from typing import Any
 import requests
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "scripts"))
+from content_safety import filter_candidates
 AUTOMATION = ROOT / "automation"
 ARTIFACTS = ROOT / "artifacts"
 STATE_PATH = AUTOMATION / "state.json"
@@ -512,7 +514,15 @@ def make_clip(source: dict[str, str]) -> tuple[Path, dict[str, Any]] | None:
     picks = data.get("candidates") or []
     if not picks:
         return None
-    best = max(picks, key=lambda item: float(item.get("score") or 0))
+    info = data.get("info") or {}
+    info.setdefault("title", source.get("title") or "")
+    safe_picks, rejected = filter_candidates(info, picks)
+    for number, reason in rejected:
+        say(f"CONTENT SAFETY: rejected candidate {number} from {source.get('url', source_path)}: {reason}")
+    if not safe_picks:
+        say("CONTENT SAFETY: no eligible general-audience moments in this source; skipping before clipping or publishing.")
+        return None
+    best = max(safe_picks, key=lambda item: float(item.get("score") or 0))
     if float(best.get("score") or 0) <= 0:
         return None
     hook = build_caption(source, best)
