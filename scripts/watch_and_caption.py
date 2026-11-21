@@ -77,7 +77,27 @@ Merge them into one account of the whole clip. Use only what the notes say. Retu
 {"summary":"2-3 sentences covering the full clip","peak_second":0,"peak_description":"what happens at the peak","on_screen_text":"",
 "genre":"reaction|scenery|glitch|detail|action","stranger_detail":"the one detail a non-gamer would find too real or too weird","ending":"what happens in the last seconds"}"""
 
+def kaggle_chat(messages, json_mode=False):
+    """Ollama running in a Kaggle notebook, exposed through ngrok (KAGGLE_OLLAMA_URL). Returns None when not configured."""
+    url = env("KAGGLE_OLLAMA_URL")
+    if not url:
+        return None
+    body = {"model": env("KAGGLE_MODEL") or "qwen2.5vl:7b", "stream": False, "messages": messages, "options": {"temperature": 0.6}}
+    if json_mode:
+        body["format"] = "json"
+    h = {"ngrok-skip-browser-warning": "1"}
+    if env("KAGGLE_API_KEY"):
+        h["Authorization"] = "Bearer " + env("KAGGLE_API_KEY")
+    r = requests.post(url.rstrip("/") + "/api/chat", headers=h, json=body, timeout=int(env("KAGGLE_TIMEOUT_S") or 300))
+    r.raise_for_status()
+    return r.json()["message"]["content"]
+
 def groq_chat(model, messages, json_mode=True):
+    if env("KAGGLE_OLLAMA_URL") and all(isinstance(m.get("content"), str) for m in messages):
+        try:
+            return kaggle_chat(messages, json_mode)
+        except Exception as e:
+            print("kaggle text failed, falling back:", str(e)[:140])
     body = {"model": model, "messages": messages, "temperature": 0.7}
     if json_mode:
         body["response_format"] = {"type": "json_object"}
@@ -94,7 +114,12 @@ def parse(txt):
     return json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
 
 def vision_json(prompt, imgs):
-    """Groq vision first, Ollama as fallback. Returns (dict, provider) or (None, None)."""
+    """Kaggle (ngrok) first, then Groq, then Ollama Cloud. Returns (dict, provider) or (None, None)."""
+    if env("KAGGLE_OLLAMA_URL"):
+        try:
+            return parse(kaggle_chat([{"role": "user", "content": prompt, "images": imgs}])), "kaggle-vision"
+        except Exception as e:
+            print("kaggle vision failed, falling back:", str(e)[:140])
     if env("GROQ_API_KEY"):
         try:
             content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b}} for b in imgs]
