@@ -3,7 +3,7 @@
 
 Watches the whole source (uniform + adaptive frames), extracts timestamped events, scores them with explainable
 components, applies a window-level safety verdict, and merges the result into candidates.json so the existing
-cut/check/caption pipeline consumes it. Reuses the Groq/Ollama vision adapters from watch_and_caption.py.
+cut/check/caption pipeline consumes it. Reuses the Kaggle vision adapter from watch_and_caption.py.
 
 Outputs per job: visual_scenes.json (schema_version 1.0), visual_scenes.md, candidates.json (merged),
 candidates_audio.json (the untouched audio/transcript candidates). Nothing here publishes anything.
@@ -147,22 +147,11 @@ Return ONLY JSON {"events":[{"start_s":0,"end_s":0,"primary_category":"<taxonomy
 Taxonomy: """ + ", ".join(TAXONOMY)
 
 def text_json(system: str, user: str) -> dict | None:
-    import requests
-    if wc.env("GROQ_API_KEY"):
-        try:
-            return wc.parse(wc.groq_chat(wc.env("GROQ_MODEL"), [{"role": "system", "content": system}, {"role": "user", "content": user}]))
-        except Exception as e:
-            print("visual merge (groq) failed:", str(e)[:120])
-    if wc.env("OLLAMA_API_KEY"):
-        try:
-            r = requests.post("https://ollama.com/api/chat", headers={"Authorization": f"Bearer {wc.env('OLLAMA_API_KEY')}"}, timeout=120,
-                              json={"model": wc.env("OLLAMA_TEXT_MODEL") or "gpt-oss:120b", "stream": False,
-                                    "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]})
-            r.raise_for_status()
-            return wc.parse(r.json()["message"]["content"])
-        except Exception as e:
-            print("visual merge (ollama) failed:", str(e)[:120])
-    return None
+    try:
+        return wc.parse(wc.llm_chat([{"role": "system", "content": system}, {"role": "user", "content": user}]))
+    except Exception as e:
+        print("visual merge (kaggle) failed:", str(e)[:120])
+        return None
 
 # ---------- events ----------
 _UNEXPECTED = {"yes": .8, "likely": .7, "uncertain": .4, "no": .1}
@@ -329,7 +318,7 @@ def analyse(video: Path, folder: Path, info: dict, cands: list[dict], duration: 
         for i, ev in enumerate(events, 1):
             ev["event_id"] = f"evt-{i:03d}"
             ev["safety"] = window_safety(ev["start_s"], ev["end_s"], res["flags"], res["ok_times"])
-    result = {**base, "analysis": {"provider": "+".join(sorted(res["providers"])) or None, "model": wc.env("GROQ_VISION_MODEL"),
+    result = {**base, "analysis": {"provider": "+".join(sorted(res["providers"])) or None, "model": wc.env("KAGGLE_MODEL"),
               "sampled_frames": len(frames), "failed_frames": failed, "chunks": res["chunks"], "chunk_errors": res["errors"],
               "elapsed_s": round(time.time() - t0, 1), "completed_at": datetime.now(timezone.utc).isoformat(), "status": status,
               "fingerprint": fp, "sample_times": times}, "events": events, "safety_flags_seen": sorted({f for _, f in res["flags"]})}

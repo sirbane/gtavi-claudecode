@@ -3,7 +3,7 @@
 
     python scripts/autopilot.py
 
-find sources -> analyse video (Kaggle model via ngrok, Groq/Ollama fallback) -> edit -> caption -> post to Facebook + YouTube
+find sources -> analyse video (Kaggle model via ngrok) -> edit -> caption -> post to Facebook + YouTube
 through Composio -> repeat. Status: python scripts/autopilot.py --status   One pass only: --once
 Everything is configurable in .env (see .env.example). Safety stays strict: no completed visual review = no post.
 """
@@ -207,9 +207,9 @@ def status() -> None:
             r = requests.get(url.rstrip("/") + "/api/tags", headers={"Authorization": "Bearer " + os.getenv("KAGGLE_API_KEY", ""), "ngrok-skip-browser-warning": "1"}, timeout=15)
             print("Kaggle model server:", "ONLINE" if r.ok else f"HTTP {r.status_code}")
         except Exception as e:
-            print("Kaggle model server: OFFLINE (falls back to Groq):", str(e)[:80])
+            print("Kaggle model server: OFFLINE (start kaggle/vision_server.ipynb):", str(e)[:80])
     else:
-        print("Kaggle model server: not configured (using Groq, then Ollama Cloud)")
+        print("Kaggle model server: NOT CONFIGURED - set KAGGLE_OLLAMA_URL and KAGGLE_API_KEY in .env")
 
 def main() -> None:
     if "--status" in sys.argv:

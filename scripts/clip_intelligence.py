@@ -28,7 +28,6 @@ ENV_DEFAULTS = {
     "LATE_DROP_MIN": "0.20",
     "FOLLOW_RATE_LOW": "0.001",
     "AVG_RETENTION_LOW": "0.35",
-    "GROQ_MODEL": "openai/gpt-oss-120b",
     "METRIC_MAP": json.dumps({
         "plays": "blue_reels_play_count",
         "avg_watch_s": "post_video_avg_time_watched",
@@ -70,16 +69,15 @@ learned from past Facebook retention data, return ONLY JSON:
  "end_after_payoff":true,"suggested_duration":0,"hook_type":"short label"}
 Let the story decide the length. Never invent footage you cannot infer from the input."""
 
-def groq(system, user):
-    r = requests.post("https://api.groq.com/openai/v1/chat/completions",
-        headers={"Authorization": f"Bearer {env('GROQ_API_KEY')}"},
-        json={"model": env("GROQ_MODEL"), "response_format": {"type": "json_object"}, "temperature": 0.4,
-              "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}]}, timeout=90)
-    r.raise_for_status()
-    return json.loads(r.json()["choices"][0]["message"]["content"])
+def llm(system, user):
+    """Talks to the Kaggle model server only."""
+    sys.path.insert(0, str(Path(__file__).parent))
+    import watch_and_caption as wc
+    txt = wc.kaggle_chat([{"role": "system", "content": system}, {"role": "user", "content": user}], json_mode=True)
+    return json.loads(txt)
 
 def make_plan(c, clip_id, text, duration=None):
-    plan = groq(PLAN_SYSTEM, f"GUIDELINES FROM DATA:\n{guidelines_text()}\n\nCLIP ({duration or '?'}s):\n{text[:6000]}")
+    plan = llm(PLAN_SYSTEM, f"GUIDELINES FROM DATA:\n{guidelines_text()}\n\nCLIP ({duration or '?'}s):\n{text[:6000]}")
     c.execute("INSERT OR IGNORE INTO clips(clip_id,duration) VALUES(?,?)", (clip_id, duration))
     c.execute("UPDATE clips SET plan_json=?, hook_type=COALESCE(hook_type,?) WHERE clip_id=?",
               (json.dumps(plan), plan.get("hook_type"), clip_id))
@@ -91,8 +89,8 @@ def cmd_plan(a):
     print(json.dumps(plan, indent=2))  # the renderer applies edit_plan to a COPY; the original clip stays untouched
 
 def cmd_plan_all(a):
-    if not env("GROQ_API_KEY"):
-        print("GROQ_API_KEY not set - skipping edit planning"); return
+    if not env("KAGGLE_OLLAMA_URL"):
+        print("KAGGLE_OLLAMA_URL not set - skipping edit planning"); return
     c = db(); out = []
     for f in sorted(Path(a.jobs_dir).glob("*/candidates.md")):
         cid = f.parent.name

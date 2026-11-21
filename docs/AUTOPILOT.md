@@ -2,7 +2,7 @@
 
 One command: `python scripts/autopilot.py`
 
-find -> analyse (Kaggle model via ngrok, Groq then Ollama Cloud as fallback) -> edit -> caption -> post to Facebook and YouTube via Composio -> repeat.
+find -> analyse (Kaggle model via ngrok, the only AI backend) -> edit -> caption -> post to Facebook and YouTube via Composio -> repeat.
 
 - `python scripts/autopilot.py --status` shows posts today, Composio calls this month and whether the Kaggle server is online.
 - `python scripts/autopilot.py --once` runs a single pass.

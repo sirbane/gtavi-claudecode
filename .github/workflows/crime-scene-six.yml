@@ -45,8 +45,8 @@ jobs:
 
       - name: Run discovery and clipping
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          KAGGLE_OLLAMA_URL: ${{ secrets.KAGGLE_OLLAMA_URL }}
+          KAGGLE_API_KEY: ${{ secrets.KAGGLE_API_KEY }}
           SAFETY_MODE: strict
         run: python automation/runner.py
 
@@ -54,14 +54,15 @@ jobs:
         continue-on-error: true
         env:
           DB_PATH: automation/clip_intel.db
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+          KAGGLE_OLLAMA_URL: ${{ secrets.KAGGLE_OLLAMA_URL }}
+          KAGGLE_API_KEY: ${{ secrets.KAGGLE_API_KEY }}
         run: python scripts/clip_intelligence.py plan-all
 
       - name: Watch clips and write captions (review first)
         continue-on-error: true
         env:
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          KAGGLE_OLLAMA_URL: ${{ secrets.KAGGLE_OLLAMA_URL }}
+          KAGGLE_API_KEY: ${{ secrets.KAGGLE_API_KEY }}
         run: python scripts/watch_and_caption.py
 
       - name: Save clips and run report

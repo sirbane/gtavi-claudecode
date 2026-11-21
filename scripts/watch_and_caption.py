@@ -2,7 +2,7 @@
 """Watch each clip with a vision model, then write the post using docs/caption_guide.md.
 
 Review-first: writes artifacts/posts/<job>/post.json + post.md. Nothing is published here.
-Vision: Groq first, Ollama Cloud as fallback, transcript-only as the last resort (flagged in the output).
+Vision + writing: the Kaggle model server only (kaggle/vision_server.ipynb). If it is unreachable the clip is flagged NEEDS VISION, never captioned blind.
 All settings come from env / .env.
 """
 import os, re, sys, json, base64, subprocess, argparse, tempfile
@@ -10,9 +10,10 @@ from pathlib import Path
 import requests
 
 D = {
-    "GROQ_VISION_MODEL": "qwen/qwen3.8-27b",
-    "OLLAMA_VISION_MODEL": "gemma4:31b",
-    "GROQ_MODEL": "openai/gpt-oss-120b",
+    "KAGGLE_MODEL": "qwen2.5vl:7b",
+    "KAGGLE_TIMEOUT_S": "120",
+    "KAGGLE_RETRIES": "4",
+    "KAGGLE_NUM_PREDICT": "700",
     "FRAME_EVERY_S": "2",
     "MAX_FRAMES": "18",
     "FRAMES_PER_CALL": "3",
@@ -78,64 +79,70 @@ Merge them into one account of the whole clip. Use only what the notes say. Retu
 "genre":"reaction|scenery|glitch|detail|action","stranger_detail":"the one detail a non-gamer would find too real or too weird","ending":"what happens in the last seconds"}"""
 
 def kaggle_chat(messages, json_mode=False):
-    """Ollama running in a Kaggle notebook, exposed through ngrok (KAGGLE_OLLAMA_URL). Returns None when not configured."""
+    """Ollama running in a Kaggle notebook, exposed through ngrok (KAGGLE_OLLAMA_URL).
+
+    Streams the reply, so KAGGLE_TIMEOUT_S is the max silence between chunks, not the total time: long answers never
+    false-timeout, a stalled server is detected fast. Retries with backoff on timeouts, dropped connections, 5xx and
+    ngrok-offline; a closed connection also makes the notebook cancel the request, so retries never pile up.
+    """
+    import time
     url = env("KAGGLE_OLLAMA_URL")
     if not url:
-        return None
-    body = {"model": env("KAGGLE_MODEL") or "qwen2.5vl:7b", "stream": False, "messages": messages, "options": {"temperature": 0.6}}
+        raise RuntimeError("KAGGLE_OLLAMA_URL is not set (run kaggle/vision_server.ipynb and paste its PUBLIC URL into .env)")
+    body = {"model": env("KAGGLE_MODEL"), "stream": True, "keep_alive": "24h", "messages": messages,
+            "options": {"temperature": 0.6, "num_predict": int(env("KAGGLE_NUM_PREDICT"))}}
     if json_mode:
         body["format"] = "json"
     h = {"ngrok-skip-browser-warning": "1"}
     if env("KAGGLE_API_KEY"):
         h["Authorization"] = "Bearer " + env("KAGGLE_API_KEY")
-    r = requests.post(url.rstrip("/") + "/api/chat", headers=h, json=body, timeout=int(env("KAGGLE_TIMEOUT_S") or 300))
-    r.raise_for_status()
-    return r.json()["message"]["content"]
-
-def groq_chat(model, messages, json_mode=True):
-    if env("KAGGLE_OLLAMA_URL") and all(isinstance(m.get("content"), str) for m in messages):
+    tries, last = int(env("KAGGLE_RETRIES")), None
+    for i in range(tries):
         try:
-            return kaggle_chat(messages, json_mode)
-        except Exception as e:
-            print("kaggle text failed, falling back:", str(e)[:140])
-    body = {"model": model, "messages": messages, "temperature": 0.7}
-    if json_mode:
-        body["response_format"] = {"type": "json_object"}
-    import time
-    for i in range(4):
-        r = requests.post("https://api.groq.com/openai/v1/chat/completions", headers={"Authorization": f"Bearer {env('GROQ_API_KEY')}"}, json=body, timeout=120)
-        if r.status_code == 429 and i < 3:
-            time.sleep(10 * (i + 1)); continue
-        break
-    r.raise_for_status()
-    return r.json()["choices"][0]["message"]["content"]
+            with requests.post(url.rstrip("/") + "/api/chat", headers=h, json=body, stream=True,
+                               timeout=(10, int(env("KAGGLE_TIMEOUT_S")))) as r:
+                if r.status_code in (401, 403):
+                    raise PermissionError("Kaggle server rejected KAGGLE_API_KEY (must match the KAGGLE_API_KEY secret in the notebook)")
+                if r.status_code >= 500 or r.status_code == 429 or r.headers.get("ngrok-error-code"):
+                    raise ConnectionError(f"Kaggle server not ready (HTTP {r.status_code}, ngrok {r.headers.get('ngrok-error-code', '-')}) - is the notebook running?")
+                r.raise_for_status()
+                out = []
+                for line in r.iter_lines():
+                    if not line:
+                        continue
+                    j = json.loads(line)
+                    if j.get("error"):
+                        raise ConnectionError("Kaggle model error: " + str(j["error"])[:200])
+                    out.append((j.get("message") or {}).get("content", ""))
+                    if j.get("done"):
+                        break
+                text = "".join(out)
+                if not text.strip():
+                    raise ConnectionError("Kaggle model returned an empty reply")
+                return text
+        except PermissionError:
+            raise
+        except (requests.exceptions.RequestException, ConnectionError, ValueError) as e:
+            last = e
+            if i < tries - 1:
+                wait = (5, 15, 30, 60)[min(i, 3)]
+                print(f"kaggle attempt {i + 1}/{tries} failed ({str(e)[:100]}); retrying in {wait}s")
+                time.sleep(wait)
+    raise RuntimeError(f"Kaggle server unreachable after {tries} tries: {str(last)[:160]}")
+
+def llm_chat(messages, json_mode=True):
+    return kaggle_chat(messages, json_mode)
 
 def parse(txt):
     return json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
 
 def vision_json(prompt, imgs):
-    """Kaggle (ngrok) first, then Groq, then Ollama Cloud. Returns (dict, provider) or (None, None)."""
-    if env("KAGGLE_OLLAMA_URL"):
-        try:
-            return parse(kaggle_chat([{"role": "user", "content": prompt, "images": imgs}])), "kaggle-vision"
-        except Exception as e:
-            print("kaggle vision failed, falling back:", str(e)[:140])
-    if env("GROQ_API_KEY"):
-        try:
-            content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b}} for b in imgs]
-            return parse(groq_chat(env("GROQ_VISION_MODEL"), [{"role": "user", "content": content}], json_mode=False)), "groq-vision"
-        except Exception as e:
-            print("groq vision failed:", str(e)[:140])
-    if env("OLLAMA_API_KEY"):
-        try:
-            r = requests.post("https://ollama.com/api/chat", headers={"Authorization": f"Bearer {env('OLLAMA_API_KEY')}"}, timeout=180,
-                              json={"model": env("OLLAMA_VISION_MODEL"), "stream": False,
-                                    "messages": [{"role": "user", "content": prompt, "images": imgs}]})
-            r.raise_for_status()
-            return parse(r.json()["message"]["content"]), "ollama-vision"
-        except Exception as e:
-            print("ollama vision failed:", str(e)[:140])
-    return None, None
+    """Kaggle model only. Returns (dict, provider) or (None, None) so callers can flag the clip as needing vision."""
+    try:
+        return parse(kaggle_chat([{"role": "user", "content": prompt, "images": imgs}])), "kaggle-vision"
+    except Exception as e:
+        print("kaggle vision failed:", str(e)[:160])
+        return None, None
 
 def describe(fr, transcript):
     per = int(env("FRAMES_PER_CALL")); parts, used = [], set()
@@ -150,7 +157,7 @@ def describe(fr, transcript):
                 "stranger_detail": "", "ending": ""}, "transcript-only (no vision available)"
     label = "+".join(sorted(used)) + f" ({len(fr)} frames, {len(parts)} segments)"
     try:
-        desc = parse(groq_chat(env("GROQ_MODEL"), [{"role": "system", "content": MERGE_SYSTEM},
+        desc = parse(llm_chat([{"role": "system", "content": MERGE_SYSTEM},
                      {"role": "user", "content": f"SEGMENTS:\n{json.dumps(parts)}\n\nTRANSCRIPT:\n{transcript[:1500] or 'none'}"}]))
     except Exception as e:
         print("merge failed, using raw segments:", str(e)[:120])
@@ -175,7 +182,7 @@ OUTPUT: return ONLY JSON {"hook":"","line2":"","extra_tags":["max 2, no # sign"]
 "hook_style":"one of the hook styles used","delivers":"why the clip delivers what the hook promises"}.
 Do NOT write the credit line or the main hashtags; the system adds them. No em dashes. Hook 12 words or fewer.\nUse ONLY details present in WHAT THE CLIP SHOWS. Never invent vehicles, people, events or timestamps. This is a video game: never say it happened in real life."""
     user = f"WHAT THE CLIP SHOWS:\n{json.dumps(desc)}\n\nTRANSCRIPT:\n{transcript[:1200]}\n\nLAST 3 HOOKS (do not repeat their opening pattern):\n{json.dumps(recent)}\n{retry_note}"
-    return parse(groq_chat(env("GROQ_MODEL"), [{"role": "system", "content": system}, {"role": "user", "content": user}]))
+    return parse(llm_chat([{"role": "system", "content": system}, {"role": "user", "content": user}]))
 
 def build(job, mp4, guide, history, out_dir):
     cand = (job / "candidates.md").read_text(errors="replace") if (job / "candidates.md").exists() else ""
@@ -184,7 +191,7 @@ def build(job, mp4, guide, history, out_dir):
     dur, fr = frames(mp4, float(env("FRAME_EVERY_S")), int(env("MAX_FRAMES")))
     desc, vision = describe(fr, transcript)
     if vision.startswith("transcript-only"):
-        rec = dict(job=job.name, status="NEEDS VISION - no caption written", video=str(mp4), vision=vision, source=src, caption="", notes=["Vision models unavailable. Fix Ollama billing or Groq limits, then re-run."])
+        rec = dict(job=job.name, status="NEEDS VISION - no caption written", video=str(mp4), vision=vision, source=src, caption="", notes=["Kaggle vision server unavailable. Start kaggle/vision_server.ipynb, check KAGGLE_OLLAMA_URL, then re-run."])
         d = out_dir / job.name; d.mkdir(parents=True, exist_ok=True)
         (d / "post.json").write_text(json.dumps(rec, indent=2))
         print("blocked (no vision)", job.name)
@@ -236,8 +243,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--jobs-dir", default="jobs"); ap.add_argument("--out", default="artifacts/posts")
     a = ap.parse_args()
-    if not env("GROQ_API_KEY"):
-        print("GROQ_API_KEY not set - skipping captions"); return
+    if not env("KAGGLE_OLLAMA_URL"):
+        print("KAGGLE_OLLAMA_URL not set - skipping captions"); return
     guide = Path(env("GUIDE_PATH")).read_text()
     hp = Path(env("HISTORY_PATH")); hp.parent.mkdir(parents=True, exist_ok=True)
     history = json.loads(hp.read_text()) if hp.exists() else []
