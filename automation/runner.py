@@ -659,3 +659,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
+    except Exception as error:
+        say("AUTOMATION STOPPED: " + str(error))
+        raise
