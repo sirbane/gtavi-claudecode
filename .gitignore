@@ -6,3 +6,6 @@ test/
 *.wav
 *.ts
 !docs/*.mp4
+.env
+autopilot.log
+automation/published.json
