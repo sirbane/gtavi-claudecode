@@ -32,7 +32,7 @@ TIKTOK_USERNAME = os.getenv("TIKTOK_USERNAME", "scurotwo8")
 GOOGLE_DRIVE_FOLDER_ID = os.getenv("GOOGLE_DRIVE_FOLDER_ID", "1nFyqTryalnj57wRC3q75PZhiQdBDcFvN")
 DRY_RUN = True  # clip-only mode: Composio, Google Drive upload and social posting are removed
 MAX_CLIPS_PER_RUN = 100
-PLATFORMS = ("youtube", "facebook", "instagram", "tiktok")
+PLATFORMS = ("youtube", "facebook")  # Instagram and TikTok code below is kept; add them back here to re-enable
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": "CrimeSceneSix-AutoClipper/1.0"})
 
@@ -214,29 +214,11 @@ def pick_drive_account(accounts: list[dict[str, Any]]) -> dict[str, Any]:
 
 def verify_destinations(accounts: list[dict[str, Any]]) -> dict[str, Any]:
     youtube = account_for(accounts, "youtube")
-    tiktok = account_for(accounts, "tiktok")
-    instagram = account_for(accounts, "instagram")
     drive = pick_drive_account(accounts)
     facebook, page_id = get_facebook_page(accounts)
+    say(f"Publishing destinations verified: YouTube / {FACEBOOK_PAGE_NAME}")
+    return {"youtube": youtube, "facebook": facebook, "facebook_page_id": page_id, "googledrive": drive}
 
-    creator = nested_payload(execute_tool(tiktok, "TIKTOK_QUERY_CREATOR_INFO", {}))
-    options = creator.get("privacy_level_options") or []
-    if "PUBLIC_TO_EVERYONE" not in options:
-        raise RuntimeError(
-            "TikTok does not currently allow public posting for this account. "
-            "No TikTok video will be posted until public visibility is enabled."
-        )
-    nickname = str(creator.get("creator_username") or "").lower()
-    if nickname and nickname != TIKTOK_USERNAME.lower():
-        raise RuntimeError(f"TikTok connection points to @{nickname}, not @{TIKTOK_USERNAME}.")
-
-    ig_id = get_instagram_id(instagram)
-    say(f"Publishing destinations verified: YouTube / {FACEBOOK_PAGE_NAME} / @{INSTAGRAM_USERNAME} / @{TIKTOK_USERNAME}")
-    return {
-        "youtube": youtube, "facebook": facebook, "facebook_page_id": page_id,
-        "instagram": instagram, "instagram_user_id": ig_id, "tiktok": tiktok,
-        "googledrive": drive,
-    }
 
 def upload_clip_to_drive(clip: Path, drive_account: dict[str, Any]) -> dict[str, Any]:
     """Upload a finished MP4 to the dedicated Google Drive folder through Composio."""
@@ -314,7 +296,7 @@ def publish_one(clip: Path, source: dict[str, Any], destinations: dict[str, Any]
             succeeded.append("facebook")
         except Exception as exc:
             say("Facebook publishing failed: " + str(exc))
-    if "instagram" not in already:
+    if "instagram" in PLATFORMS and "instagram" not in already:
         try:
             file_ref = stage_video(clip, "instagram", "INSTAGRAM_POST_IG_USER_MEDIA")
             created = execute_tool(destinations["instagram"], "INSTAGRAM_POST_IG_USER_MEDIA", {
@@ -338,7 +320,7 @@ def publish_one(clip: Path, source: dict[str, Any], destinations: dict[str, Any]
             succeeded.append("instagram")
         except Exception as exc:
             say("Instagram publishing failed: " + str(exc))
-    if "tiktok" not in already:
+    if "tiktok" in PLATFORMS and "tiktok" not in already:
         try:
             file_ref = stage_video(clip, "tiktok", "TIKTOK_UPLOAD_VIDEO")
             result = execute_tool(destinations["tiktok"], "TIKTOK_UPLOAD_VIDEO", {
@@ -635,7 +617,7 @@ def main() -> int:
         url = source["url"]
         done = state["posted_sources"].get(url, [])
         if set(done) >= set(PLATFORMS):
-            say("Already posted to all four platforms; skipping " + url)
+            say("Already posted to all configured platforms; skipping " + url)
             continue
         try:
             made = make_clip(source)
@@ -661,7 +643,7 @@ def main() -> int:
         save_state(state)
         say("Published successfully to: " + (", ".join(succeeded) if succeeded else "none"))
         if set(state["posted_sources"][url]) >= set(PLATFORMS):
-            say("All four platforms have accepted this source.")
+            say("All configured platforms have accepted this source.")
         else:
             say("Some platforms remain pending. The next run will retry only the missing destinations.")
         return 0 if succeeded else 1
