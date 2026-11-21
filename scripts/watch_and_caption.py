@@ -13,7 +13,9 @@ D = {
     "GROQ_VISION_MODEL": "qwen/qwen3.8-27b",
     "OLLAMA_VISION_MODEL": "gemma4:31b",
     "GROQ_MODEL": "openai/gpt-oss-120b",
-    "FRAME_COUNT": "3",
+    "FRAME_EVERY_S": "2",
+    "MAX_FRAMES": "18",
+    "FRAMES_PER_CALL": "3",
     "FFMPEG_BIN": "ffmpeg",
     "HISTORY_PATH": "automation/caption_history.json",
     "GUIDE_PATH": "docs/caption_guide.md",
@@ -39,10 +41,12 @@ def duration(mp4):
     m = re.search(r"Duration: (\d+):(\d+):([\d.]+)", out)
     return int(m[1]) * 3600 + int(m[2]) * 60 + float(m[3]) if m else 30.0
 
-def frames(mp4, n):
-    dur = duration(mp4); out = []
+def frames(mp4, step, maxn):
+    """One frame every `step` seconds (capped), spread across the whole clip."""
+    dur = duration(mp4)
+    n = max(3, min(maxn, int(dur / step) + 1)); out = []
     for i in range(n):
-        t = dur * (0.04 + 0.92 * i / max(n - 1, 1))
+        t = dur * (0.02 + 0.96 * i / max(n - 1, 1))
         with tempfile.TemporaryDirectory() as td:
             f = Path(td) / "f.jpg"
             sh([env("FFMPEG_BIN"), "-y", "-ss", f"{t:.2f}", "-i", str(mp4), "-frames:v", "1", "-vf", "scale=480:-2", "-q:v", "6", str(f)])
@@ -64,11 +68,14 @@ def creator(source):
         print("creator lookup failed:", str(e)[:120])
     return None, None
 
-VISION_PROMPT = """These are {n} frames from a short GTA 6 clip at seconds {ts}, plus the transcript (may be empty).
-Describe only what you can actually see or read. Return ONLY JSON:
-{{"summary":"2 sentences","peak_second":0,"peak_description":"what happens at the peak","on_screen_text":"text burned into the video or empty",
-"genre":"reaction|scenery|glitch|detail|action","stranger_detail":"the one detail a non-gamer would find too real or too weird","ending":"what happens in the last seconds"}}
-TRANSCRIPT: {tr}"""
+CHUNK_PROMPT = """These are {n} consecutive frames from a short GTA 6 clip, taken at seconds {ts}.
+Describe only what you can actually see or read: the action, vehicles, characters, on-screen text, the streamer's face-cam, anything odd.
+Return ONLY JSON: {{"what_happens":"2 short sentences","on_screen_text":"","notable":"one specific detail or empty"}}"""
+
+MERGE_SYSTEM = """You receive notes on consecutive segments of one GTA 6 clip (with timestamps in seconds) plus the transcript.
+Merge them into one account of the whole clip. Use only what the notes say. Return ONLY JSON:
+{"summary":"2-3 sentences covering the full clip","peak_second":0,"peak_description":"what happens at the peak","on_screen_text":"",
+"genre":"reaction|scenery|glitch|detail|action","stranger_detail":"the one detail a non-gamer would find too real or too weird","ending":"what happens in the last seconds"}"""
 
 def groq_chat(model, messages, json_mode=True):
     body = {"model": model, "messages": messages, "temperature": 0.7}
@@ -86,26 +93,47 @@ def groq_chat(model, messages, json_mode=True):
 def parse(txt):
     return json.loads(re.search(r"\{.*\}", txt, re.S).group(0))
 
-def describe(fr, transcript):
-    prompt = VISION_PROMPT.format(n=len(fr), ts=", ".join(str(t) for t, _ in fr), tr=transcript[:1500] or "none")
+def vision_json(prompt, imgs):
+    """Groq vision first, Ollama as fallback. Returns (dict, provider) or (None, None)."""
     if env("GROQ_API_KEY"):
-        for k in (len(fr), 2):
-            try:
-                content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b}} for _, b in fr[:k]]
-                return parse(groq_chat(env("GROQ_VISION_MODEL"), [{"role": "user", "content": content}], json_mode=False)), "groq-vision"
-            except Exception as e:
-                print("groq vision failed:", str(e)[:140])
+        try:
+            content = [{"type": "text", "text": prompt}] + [{"type": "image_url", "image_url": {"url": "data:image/jpeg;base64," + b}} for b in imgs]
+            return parse(groq_chat(env("GROQ_VISION_MODEL"), [{"role": "user", "content": content}], json_mode=False)), "groq-vision"
+        except Exception as e:
+            print("groq vision failed:", str(e)[:140])
     if env("OLLAMA_API_KEY"):
         try:
             r = requests.post("https://ollama.com/api/chat", headers={"Authorization": f"Bearer {env('OLLAMA_API_KEY')}"}, timeout=180,
                               json={"model": env("OLLAMA_VISION_MODEL"), "stream": False,
-                                    "messages": [{"role": "user", "content": prompt, "images": [b for _, b in fr]}]})
+                                    "messages": [{"role": "user", "content": prompt, "images": imgs}]})
             r.raise_for_status()
             return parse(r.json()["message"]["content"]), "ollama-vision"
         except Exception as e:
             print("ollama vision failed:", str(e)[:140])
-    return {"summary": "", "peak_second": None, "peak_description": "", "on_screen_text": "", "genre": "action",
-            "stranger_detail": "", "ending": ""}, "transcript-only (no vision available)"
+    return None, None
+
+def describe(fr, transcript):
+    per = int(env("FRAMES_PER_CALL")); parts, used = [], set()
+    for i in range(0, len(fr), per):
+        grp = fr[i:i + per]
+        j, prov = vision_json(CHUNK_PROMPT.format(n=len(grp), ts=", ".join(str(t) for t, _ in grp)), [b for _, b in grp])
+        if j is None:
+            continue
+        used.add(prov); parts.append({"from_s": grp[0][0], "to_s": grp[-1][0], **j})
+    if not parts:
+        return {"summary": "", "peak_second": None, "peak_description": "", "on_screen_text": "", "genre": "action",
+                "stranger_detail": "", "ending": ""}, "transcript-only (no vision available)"
+    label = "+".join(sorted(used)) + f" ({len(fr)} frames, {len(parts)} segments)"
+    try:
+        desc = parse(groq_chat(env("GROQ_MODEL"), [{"role": "system", "content": MERGE_SYSTEM},
+                     {"role": "user", "content": f"SEGMENTS:\n{json.dumps(parts)}\n\nTRANSCRIPT:\n{transcript[:1500] or 'none'}"}]))
+    except Exception as e:
+        print("merge failed, using raw segments:", str(e)[:120])
+        desc = {"summary": " ".join(p.get("what_happens", "") for p in parts), "peak_second": None, "peak_description": "",
+                "on_screen_text": " ".join(p.get("on_screen_text", "") for p in parts).strip(), "genre": "action",
+                "stranger_detail": "", "ending": parts[-1].get("what_happens", "")}
+    desc["segments"] = parts
+    return desc, label
 
 def clean(s):
     s = (s or "").replace("\u2014", ", ").replace("\u2013", "-")
@@ -128,7 +156,7 @@ def build(job, mp4, guide, history, out_dir):
     cand = (job / "candidates.md").read_text(errors="replace") if (job / "candidates.md").exists() else ""
     src = (re.search(r"^source:\s*(\S+)", cand, re.M) or [None, ""])[1]
     transcript = " ".join(l[1:].strip() for l in cand.splitlines() if l.startswith(">"))
-    dur, fr = frames(mp4, int(env("FRAME_COUNT")))
+    dur, fr = frames(mp4, float(env("FRAME_EVERY_S")), int(env("MAX_FRAMES")))
     desc, vision = describe(fr, transcript)
     if vision.startswith("transcript-only"):
         rec = dict(job=job.name, status="NEEDS VISION - no caption written", video=str(mp4), vision=vision, source=src, caption="", notes=["Vision models unavailable. Fix Ollama billing or Groq limits, then re-run."])
