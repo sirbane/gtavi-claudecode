@@ -516,6 +516,16 @@ def make_clip(source: dict[str, str]) -> tuple[Path, dict[str, Any]] | None:
         return None
     info = data.get("info") or {}
     info.setdefault("title", source.get("title") or "")
+    try:
+        import visual_scenes
+        picks = visual_scenes.enrich_candidates(folder, data, info)
+        say(f"VISUAL: {len(picks)} candidate(s) after scene analysis of {source.get('url', source_path)} (see {folder / 'visual_scenes.md'})")
+    except Exception as exc:  # analysis must never crash the run; the safety gate then fails closed
+        say(f"VISUAL: scene analysis failed ({str(exc)[:160]}); candidates stay unreviewed and are held by the safety gate")
+        picks = [{**p, "visual_status": "error", "needs_vision_review": True} for p in picks]
+    if not picks:
+        say("VISUAL: no strong visual moment in this source; skipping it (a quality decision, not a failure).")
+        return None
     safe_picks, rejected = filter_candidates(info, picks)
     for number, reason in rejected:
         say(f"CONTENT SAFETY: rejected candidate {number} from {source.get('url', source_path)}: {reason}")
@@ -539,6 +549,9 @@ def make_clip(source: dict[str, str]) -> tuple[Path, dict[str, Any]] | None:
         source["title"] = source.get("title") or "GTA 6 live-stream moment"
         source["channel"] = source.get("channel") or "Original creator"
     meta.update({"source_url": source["url"], "source_title": source["title"], "source_channel": source["channel"]})
+    meta.update({"visual": best.get("visual"), "category": best.get("category"), "safety": best.get("safety"),
+                 "visual_status": best.get("visual_status"), "needs_vision_review": bool(best.get("needs_vision_review")),
+                 "score_components": (best.get("visual") or {}).get("components"), "clip_created_only": True})
     sidecar.write_text(json.dumps(meta, indent=2), encoding="utf-8")
     caption = f"{source['title']}\n\nOriginal creator: {source['channel']}\nSource: {source['url']}\n#GTA6 #GTAVI #CrimeSceneSix #Shorts"
     run([sys.executable, "scripts/check.py", str(clip), "--caption", caption], timeout=120)
