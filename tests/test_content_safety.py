@@ -23,6 +23,10 @@ def test_visual_adult_label_does_not_block_but_other_rejections_do():
     safe, rej = cs.filter_candidates({}, [_c(safety={"status": "reject_adult", "reason": "adult scene", "flags": ["adult"], "confidence": .95})])
     assert len(safe) == 1 and not rej
 
+def test_low_confidence_adult_label_is_still_held():
+    safe, rej = cs.filter_candidates({}, [_c(safety={"status": "reject_adult", "reason": "adult scene", "flags": ["adult"], "confidence": .4})])
+    assert not safe and rej[0][1].startswith("hold_review")
+
 def test_missing_visual_review_fails_closed_in_strict(monkeypatch):
     monkeypatch.delenv("SAFETY_MODE", raising=False)
     safe, rej = cs.filter_candidates({}, [{"n": 1, "text": "hello", "score": 9}])

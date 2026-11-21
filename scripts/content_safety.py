@@ -35,7 +35,8 @@ def evaluate(info: dict, cand: dict) -> dict:
         return _decision("analysis_failed", "no completed visual review for this window; failing closed", [], 0.0, True)
     status = vis["status"]
     if status == "reject_adult":
-        return _decision("pass", "adult-content restriction disabled; visual review completed", vis.get("flags"), float(vis.get("confidence") or 0))
+        vis = {**vis, "status": "pass", "reason": "adult-content restriction disabled; visual review completed"}
+        status = "pass"
     if status != "pass":
         return {**vis, "policy_version": POLICY_VERSION}
     if float(vis.get("confidence") or 0) < _min_conf():
