@@ -131,39 +131,108 @@ def twitch_login(url):
     return m.group(1).lower() if m and m.group(1).lower() not in ("videos", "directory") else None
 
 
+RECORD_FORMAT = "b[height<=720]/bv*[height<=720]+ba/b"
+PIPE_FORMAT = "b[height<=720]/b"
+PROC_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+
+
 class Recorder:
+    """Records the stream into 60 s .ts segments.
+
+    First tries ffmpeg directly on the stream URL(s) from yt-dlp. If that recorder exits before a single
+    segment was written (expired or blocked stream URL, HLS read errors), it restarts once in pipe mode
+    (yt-dlp downloads, ffmpeg segments), which handles those cases better.
+    """
+
     def __init__(self, ld, url, minutes):
-        self.ld, self.csv = ld, ld / "segments.csv"
-        r = run(ytdlp_base() + ["-g", "-f", "b[height<=720]/bv*[height<=720]+ba/b", url], capture=True)
-        urls = [u for u in r.stdout.split() if u.startswith("http")]
-        if not urls:
-            sys.exit("could not get a stream URL (is the video live?)")
+        self.ld, self.url, self.minutes = ld, url, minutes
+        self.csv = ld / "segments.csv"
+        self.proc = None
+        self.feeder = None
+        self.t0 = None
+        self.mode = "direct"
+        self.began = time.time()
+        if not self._start_direct():
+            print("no direct stream URL available, using yt-dlp pipe mode", flush=True)
+            self._start_pipe()
+
+    def _segment_args(self):
+        return ["-c", "copy", "-t", str(int(self.minutes * 60)), "-f", "segment", "-segment_time", "60",
+                "-segment_format", "mpegts", "-reset_timestamps", "1", "-segment_list", str(self.csv),
+                "-segment_list_type", "csv", str(self.ld / "seg_%05d.ts")]
+
+    def _start_direct(self):
+        r = run(ytdlp_base() + ["-g", "-f", RECORD_FORMAT, self.url], capture=True, check=False)
+        urls = [u for u in (r.stdout or "").split() if u.startswith("http")]
+        if r.returncode != 0 or not urls:
+            return False
         cmd = [tool("ffmpeg"), "-y", "-loglevel", "warning"]
         for u in urls:
             cmd += ["-reconnect", "1", "-reconnect_streamed", "1", "-reconnect_delay_max", "5", "-i", u]
         for i in range(len(urls)):
             cmd += ["-map", str(i)]
-        cmd += ["-c", "copy", "-t", str(int(minutes * 60)), "-f", "segment", "-segment_time", "60",
-                "-segment_format", "mpegts", "-reset_timestamps", "1", "-segment_list", str(self.csv),
-                "-segment_list_type", "csv", str(ld / "seg_%05d.ts")]
-        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, creationflags=getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
-        self.t0 = None
+        cmd += self._segment_args()
+        self.proc = subprocess.Popen(cmd, stdin=subprocess.PIPE, creationflags=PROC_GROUP)
+        return True
 
-    def alive(self):
-        return self.proc.poll() is None
+    def _start_pipe(self):
+        self.mode = "pipe"
+        self.began = time.time()
+        self.feeder = subprocess.Popen(ytdlp_base() + ["-f", PIPE_FORMAT, "-o", "-", self.url],
+                                       stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, creationflags=PROC_GROUP)
+        cmd = [tool("ffmpeg"), "-y", "-loglevel", "warning", "-i", "pipe:0", "-map", "0"] + self._segment_args()
+        self.proc = subprocess.Popen(cmd, stdin=self.feeder.stdout, creationflags=PROC_GROUP)
+        self.feeder.stdout.close()
 
-    def stop(self):
-        if self.alive():
+    def has_data(self):
+        for f in self.ld.glob("seg_*.ts"):
             try:
-                self.proc.stdin.write(b"q\n"); self.proc.stdin.flush()
+                if f.stat().st_size > 0:
+                    return True
             except OSError:
                 pass
+        return False
+
+    def alive(self):
+        return self.proc is not None and self.proc.poll() is None
+
+    def rescue(self):
+        """Call when the recorder has exited. Returns True if a pipe-mode restart was started."""
+        if self.mode != "direct" or self.has_data() or time.time() - self.began > 180:
+            return False
+        print("recorder stopped before capturing anything, retrying with yt-dlp pipe mode", flush=True)
+        for f in list(self.ld.glob("seg_*.ts")) + [self.csv]:
+            try:
+                f.unlink(missing_ok=True)
+            except OSError:
+                pass
+        self._start_pipe()
+        self.t0 = None
+        return True
+
+    def stop(self):
+        if self.feeder is not None and self.feeder.poll() is None:
+            try:
+                self.feeder.terminate()  # ffmpeg then sees end of input and finalizes the last segment
+            except OSError:
+                pass
+        if self.alive():
+            if self.proc.stdin is not None:
+                try:
+                    self.proc.stdin.write(b"q\n"); self.proc.stdin.flush()
+                except OSError:
+                    pass
             try:
                 self.proc.wait(20)
             except subprocess.TimeoutExpired:
                 self.proc.terminate()
                 try: self.proc.wait(5)
                 except subprocess.TimeoutExpired: self.proc.kill()
+        if self.feeder is not None:
+            try:
+                self.feeder.wait(5)
+            except subprocess.TimeoutExpired:
+                self.feeder.kill()
 
     def segments(self):
         """[(path, start, end, mtime, complete)] with cumulative timeline starts (seconds since recording began)."""
@@ -256,7 +325,9 @@ def main():
         print(("clip " + out.name if ok else "cut failed") + f" (spike at {off}, {rate} msgs/{a.window}s, {words})", flush=True)
 
     try:
-        while now() < end_at and rec.alive():
+        while now() < end_at:
+            if not rec.alive() and not rec.rescue():
+                break
             time.sleep(1)
             tail.poll()
             t = now()
@@ -291,6 +362,11 @@ def main():
         for p in pending:
             finish_one(p[:4], final=True)
         save_json(ld / "live.json", {"url": a.url, "spikes": spikes, "minutes": a.minutes})
+    got = len(rec.segments())
+    if got == 0:
+        print(f"WARNING: nothing was recorded (mode: {rec.mode}). 0 spikes here means the recording failed, not that chat was quiet.", flush=True)
+    else:
+        print(f"recorded {got} segment(s) via {rec.mode} mode", flush=True)
     print(f"done: {spikes} spike(s). See {spikes_md}")
 
 
