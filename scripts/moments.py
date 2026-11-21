@@ -107,7 +107,10 @@ def z(a):
 
 
 def smooth(a, k):
-    k = max(1, int(k))
+    a = np.asarray(a, dtype=float)
+    if a.size == 0:
+        return a
+    k = max(1, min(int(k), a.size))  # a window longer than the clip made 'same' convolution return the wrong length
     return np.convolve(a, np.ones(k) / k, mode="same")
 
 
