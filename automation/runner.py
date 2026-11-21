@@ -258,8 +258,7 @@ def upload_clip_to_drive(clip: Path, drive_account: dict[str, Any]) -> dict[str,
 
 def drive_archive(clip: Path, destinations: dict[str, Any] | None) -> None:
     if not destinations or not destinations.get("googledrive"):
-        say("Google Driv
-e archive skipped: Composio destinations are not verified in this run.")
+        say("Google Drive archive skipped: Composio destinations are not verified in this run.")
         return
     try:
         upload_clip_to_drive(clip, destinations["googledrive"])
@@ -490,8 +489,7 @@ def job_folder_for(source_path: str) -> Path:
     if source_path.startswith(("http://", "https://")):
         stem_source = source_path.split("v=")[-1].split("/")[-1].lower()
     else:
-        stem_source = Pat
-h(source_path).stem.lower()
+        stem_source = Path(source_path).stem.lower()
     stem = re.sub(r"[^a-z0-9]+", "-", stem_source)[:24].strip("-") or "job"
     key = hashlib.sha1(source_path.encode()).hexdigest()[:8]
     return ROOT / "jobs" / f"{stem}-{key}"
@@ -661,7 +659,3 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except Exception as error:
-        say("AUTOMATION STOPPED: " + str(error))
-        raise
-
