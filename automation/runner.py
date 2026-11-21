@@ -18,6 +18,16 @@ from typing import Any
 
 import requests
 
+# Windows consoles and pipes default to cp1252 and crash on emoji in video titles.
+# Force UTF-8 here, and make every child process inherit it.
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "scripts"))
 from content_safety import filter_candidates
@@ -42,7 +52,7 @@ def say(message: str) -> None:
 def run(command: list[str], timeout: int | None = None) -> str:
     say("$ " + " ".join(map(str, command)))
     result = subprocess.run(
-        command, cwd=ROOT, text=True, stdout=subprocess.PIPE,
+        command, cwd=ROOT, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT, timeout=timeout
     )
     output = result.stdout or ""
@@ -375,7 +385,7 @@ def youtube_probe() -> bool:
     command = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--skip-download", "--socket-timeout", "15",
                "--print", "%(id)s | %(title)s", "https://www.youtube.com/watch?v=jNQXAC9IVRw"]
     try:
-        result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
+        result = subprocess.run(command, cwd=ROOT, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=90)
     except subprocess.TimeoutExpired:
         say("YouTube reachability probe: TIMED OUT")
         return False
@@ -425,7 +435,7 @@ def ytsearch_fallback() -> list[dict[str, str]]:
         command = [sys.executable, "-m", "yt_dlp", "--no-warnings", "--no-progress", "-J", "--flat-playlist", "--playlist-end", "30", query]
         say("Fallback search: " + query)
         try:
-            result = subprocess.run(command, cwd=ROOT, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
+            result = subprocess.run(command, cwd=ROOT, text=True, encoding="utf-8", errors="replace", stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=180)
         except subprocess.TimeoutExpired:
             say("Fallback search timed out: " + query)
             continue
