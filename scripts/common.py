@@ -2,6 +2,16 @@
 import hashlib, json, os, re, shutil, subprocess, sys
 from pathlib import Path
 
+# Windows consoles and pipes default to cp1252 and crash on emoji in video titles.
+# Force UTF-8 here, and make every child process inherit it.
+os.environ.setdefault("PYTHONUTF8", "1")
+os.environ.setdefault("PYTHONIOENCODING", "utf-8")
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:
+        pass
+
 ROOT = Path(os.environ.get("CLIP_DESK_HOME", Path.cwd()))
 JOBS = ROOT / "jobs"
 
